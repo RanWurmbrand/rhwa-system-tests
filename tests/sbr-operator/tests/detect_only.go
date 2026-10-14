@@ -57,6 +57,139 @@ func deleteKeepalivePods(podNames []string) {
 	}
 }
 
+// detectOnlyAgentPodsRunning returns nil once the agent DaemonSet has rolled out its current
+// pod template and every desired pod has a running container. It checks Running instead of
+// Ready because the agent probes fail on healthy agents (RHWA-1759, RHWA-1057). Switch to
+// Ready once those are fixed.
+func detectOnlyAgentPodsRunning(dsName string) error {
+	agentDS, dsErr := APIClient.DaemonSets(medik8sparams.OperatorNs).Get(
+		context.TODO(), dsName, metav1.GetOptions{})
+	if dsErr != nil {
+		return fmt.Errorf("DaemonSet %s not found: %w", dsName, dsErr)
+	}
+
+	desired := agentDS.Status.DesiredNumberScheduled
+	if desired == 0 {
+		return fmt.Errorf("DaemonSet %s: no pods scheduled yet", dsName)
+	}
+
+	if agentDS.Status.ObservedGeneration < agentDS.Generation {
+		return fmt.Errorf("DaemonSet %s: generation %d not yet observed (observed %d)",
+			dsName, agentDS.Generation, agentDS.Status.ObservedGeneration)
+	}
+
+	if agentDS.Status.CurrentNumberScheduled < desired || agentDS.Status.UpdatedNumberScheduled < desired {
+		return fmt.Errorf("DaemonSet %s: %d/%d pods scheduled, %d/%d updated", dsName,
+			agentDS.Status.CurrentNumberScheduled, desired, agentDS.Status.UpdatedNumberScheduled, desired)
+	}
+
+	listOpts := metav1.ListOptions{}
+
+	if agentDS.Spec.Selector != nil {
+		sel, selErr := metav1.LabelSelectorAsSelector(agentDS.Spec.Selector)
+		if selErr != nil {
+			return fmt.Errorf("converting DaemonSet selector: %w", selErr)
+		}
+
+		listOpts.LabelSelector = sel.String()
+	}
+
+	podList, podErr := APIClient.CoreV1Interface.Pods(medik8sparams.OperatorNs).List(
+		context.TODO(), listOpts)
+	if podErr != nil {
+		return fmt.Errorf("listing agent pods: %w", podErr)
+	}
+
+	var running int
+
+	for i := range podList.Items {
+		agentPod := &podList.Items[i]
+
+		if !metav1.IsControlledBy(agentPod, agentDS) || agentPod.DeletionTimestamp != nil {
+			continue
+		}
+
+		if agentPod.Status.Phase != corev1.PodRunning {
+			return fmt.Errorf("pod %s on node %s is %s", agentPod.Name, agentPod.Spec.NodeName, agentPod.Status.Phase)
+		}
+
+		hasRunningContainer := false
+
+		for j := range agentPod.Status.ContainerStatuses {
+			if agentPod.Status.ContainerStatuses[j].State.Running != nil {
+				hasRunningContainer = true
+
+				break
+			}
+		}
+
+		if !hasRunningContainer {
+			return fmt.Errorf("pod %s is Running phase but no container has Running state (crash-looping?)",
+				agentPod.Name)
+		}
+
+		running++
+	}
+
+	if running < int(desired) {
+		return fmt.Errorf("DaemonSet %s: %d/%d pods with running containers", dsName, running, desired)
+	}
+
+	return nil
+}
+
+// setDetectOnlyMode patches the detect-only SBRC to the given mode, waits for the spec to
+// reflect it, and waits for the agent DaemonSet to roll out pods running with the new mode.
+func setDetectOnlyMode(gvkSource *unstructured.Unstructured, mode string) {
+	By(fmt.Sprintf("Patching StorageBasedRemediationConfig to detectOnlyMode: %s", mode))
+
+	patchTarget := &unstructured.Unstructured{}
+	patchTarget.SetGroupVersionKind(gvkSource.GroupVersionKind())
+	patchTarget.SetName(sbrparams.SBRCDetectOnlyTestName)
+	patchTarget.SetNamespace(medik8sparams.OperatorNs)
+	patchErr := APIClient.Patch(context.TODO(), patchTarget,
+		client.RawPatch(types.MergePatchType, fmt.Appendf(nil, `{"spec":{"detectOnlyMode":%q}}`, mode)))
+	Expect(patchErr).ToNot(HaveOccurred(),
+		"Patching StorageBasedRemediationConfig detectOnlyMode to %s must succeed", mode)
+
+	By(fmt.Sprintf("Verifying detectOnlyMode is now %s in the StorageBasedRemediationConfig spec", mode))
+
+	Eventually(func() error {
+		freshSBRC := &unstructured.Unstructured{}
+		freshSBRC.SetGroupVersionKind(gvkSource.GroupVersionKind())
+
+		if fetchErr := APIClient.Get(context.TODO(),
+			types.NamespacedName{Name: sbrparams.SBRCDetectOnlyTestName, Namespace: medik8sparams.OperatorNs},
+			freshSBRC); fetchErr != nil {
+			return fmt.Errorf("failed to fetch StorageBasedRemediationConfig: %w", fetchErr)
+		}
+
+		currentMode, found, nestedErr := unstructured.NestedString(freshSBRC.Object, "spec", "detectOnlyMode")
+		if nestedErr != nil {
+			return fmt.Errorf("reading spec.detectOnlyMode: %w", nestedErr)
+		}
+
+		if !found || currentMode != mode {
+			return fmt.Errorf("detectOnlyMode is %q, want %s", currentMode, mode)
+		}
+
+		return nil
+	}, medik8sparams.DefaultTimeout, sbrparams.DefaultPollInterval).Should(Succeed(),
+		"StorageBasedRemediationConfig detectOnlyMode must reflect %s after patch", mode)
+
+	By(fmt.Sprintf("Verifying agent DaemonSet rolls out running pods with detectOnlyMode: %s", mode))
+
+	dsName := sbrparams.SBRAgentDaemonSetPrefix + sbrparams.SBRCDetectOnlyTestName
+
+	Eventually(func() error {
+		return detectOnlyAgentPodsRunning(dsName)
+	}, sbrparams.SBRCReadyTimeout, sbrparams.DefaultPollInterval).Should(Succeed(),
+		func() string {
+			return fmt.Sprintf("Agent DaemonSet %s must run all pods after setting detectOnlyMode to %s\n%s",
+				dsName, mode, sbrcReadinessDiagnostics(sbrparams.SBRCDetectOnlyTestName, dsName))
+		})
+}
+
 var _ = Describe(
 	"SBR Functional — detectOnlyMode",
 	Ordered,
@@ -64,8 +197,6 @@ var _ = Describe(
 	Label(labels.OperatorSBR), func() {
 		var (
 			detectOnlySBRC  *unstructured.Unstructured
-			nhcCR           *unstructured.Unstructured
-			nhcCreatedByUs  bool
 			rwxStorageClass string
 			targetNodeName  string
 			injectorPodName string
@@ -216,79 +347,7 @@ var _ = Describe(
 			dsName := sbrparams.SBRAgentDaemonSetPrefix + sbrparams.SBRCDetectOnlyTestName
 
 			Eventually(func() error {
-				agentDS, dsErr := APIClient.DaemonSets(medik8sparams.OperatorNs).Get(
-					context.TODO(), dsName, metav1.GetOptions{})
-				if dsErr != nil {
-					return fmt.Errorf("DaemonSet %s not found: %w", dsName, dsErr)
-				}
-
-				if agentDS.Status.DesiredNumberScheduled == 0 {
-					return fmt.Errorf("DaemonSet %s: no pods scheduled yet", dsName)
-				}
-
-				if agentDS.Status.CurrentNumberScheduled < agentDS.Status.DesiredNumberScheduled {
-					return fmt.Errorf("DaemonSet %s: %d/%d pods scheduled",
-						dsName, agentDS.Status.CurrentNumberScheduled, agentDS.Status.DesiredNumberScheduled)
-				}
-
-				listOpts := metav1.ListOptions{}
-
-				if agentDS.Spec.Selector != nil {
-					sel, selErr := metav1.LabelSelectorAsSelector(agentDS.Spec.Selector)
-					if selErr != nil {
-						return fmt.Errorf("converting DaemonSet selector: %w", selErr)
-					}
-
-					listOpts.LabelSelector = sel.String()
-				}
-
-				podList, podErr := APIClient.CoreV1Interface.Pods(medik8sparams.OperatorNs).List(
-					context.TODO(), listOpts)
-				if podErr != nil {
-					return fmt.Errorf("listing agent pods: %w", podErr)
-				}
-
-				var running int
-
-				for i := range podList.Items {
-					pod := &podList.Items[i]
-
-					if !metav1.IsControlledBy(pod, agentDS) {
-						continue
-					}
-
-					if pod.DeletionTimestamp != nil {
-						continue
-					}
-
-					if pod.Status.Phase != corev1.PodRunning {
-						continue
-					}
-
-					hasRunningContainer := false
-
-					for j := range pod.Status.ContainerStatuses {
-						if pod.Status.ContainerStatuses[j].State.Running != nil {
-							hasRunningContainer = true
-
-							break
-						}
-					}
-
-					if !hasRunningContainer {
-						return fmt.Errorf("pod %s is Running phase but no container has Running state (crash-looping?)",
-							pod.Name)
-					}
-
-					running++
-				}
-
-				if running < int(agentDS.Status.DesiredNumberScheduled) {
-					return fmt.Errorf("DaemonSet %s: %d/%d pods with running containers",
-						dsName, running, agentDS.Status.DesiredNumberScheduled)
-				}
-
-				return nil
+				return detectOnlyAgentPodsRunning(dsName)
 			}, sbrparams.SBRCReadyTimeout, sbrparams.DefaultPollInterval).Should(Succeed(),
 				func() string {
 					return fmt.Sprintf(
@@ -303,18 +362,6 @@ var _ = Describe(
 
 			deleteKeepalivePods(keepalivePods)
 			keepalivePods = nil
-
-			By("AfterAll: removing NHC CR if created by this test")
-
-			if nhcCreatedByUs && nhcCR != nil {
-				cleanupNHCCR(sbrparams.NHCDetectOnlyTestName)
-			}
-
-			By("AfterAll: removing any SBR CR for target node")
-
-			if targetNodeName != "" {
-				cleanupSBRCR(targetNodeName)
-			}
 
 			By("AfterAll: flushing any remaining injector pod and iptables rules")
 
@@ -483,17 +530,6 @@ var _ = Describe(
 							GinkgoWriter.Printf("Warning: delete injector pod %s: %v\n", injectorPodName, delErr)
 						}
 					}
-
-					By("DeferCleanup: removing SBR CR for target node")
-
-					cleanupSBRCR(targetNodeName)
-
-					By("DeferCleanup: removing NHC CR if created by this test")
-
-					if nhcCreatedByUs && nhcCR != nil {
-						cleanupNHCCR(sbrparams.NHCDetectOnlyTestName)
-						nhcCreatedByUs = false
-					}
 				})
 
 				By("Fetching the StorageBasedRemediationConfig from the cluster")
@@ -512,26 +548,51 @@ var _ = Describe(
 					"detectOnlyMode must be present in StorageBasedRemediationConfig spec")
 				Expect(mode).To(Equal("Enabled"),
 					"detectOnlyMode must be Enabled in the StorageBasedRemediationConfig spec")
-				nhcInstalled := isNHCCRDInstalled()
 
-				if nhcInstalled {
-					By("NHC is installed — creating NodeHealthCheck CR for detect-only suppression test")
+				// Toggle before injecting the storage fault. A toggle restarts every agent pod, and
+				// after the fault the target node's CephFS client can be blocklisted so a new agent
+				// pod there can never mount the shared volume.
+				setDetectOnlyMode(detectOnlySBRC, "Disabled")
+				setDetectOnlyMode(detectOnlySBRC, "Enabled")
 
-					ensureSBRTemplate()
-					nhcCR = buildNHC(sbrparams.NHCDetectOnlyTestName)
+				// Configuring SBR as an NHC remediator while detectOnlyMode is Enabled is a
+				// misconfiguration (RHWA-1876), and the SBR remediation controller does not check
+				// detectOnlyMode before cordoning and fencing (RHWA-1877). Fail before injecting the
+				// storage fault so such an NHC cannot fence the target node.
+				By("Verifying no NodeHealthCheck uses SBR as its remediator")
 
-					if createNHCErr := APIClient.Create(context.TODO(), nhcCR); createNHCErr != nil {
-						if !k8serrors.IsAlreadyExists(createNHCErr) {
-							Expect(createNHCErr).ToNot(HaveOccurred(),
-								"Failed to create NodeHealthCheck CR %q", sbrparams.NHCDetectOnlyTestName)
-						}
+				preflightCtx, cancelPreflight := context.WithTimeout(context.Background(), medik8sparams.DefaultTimeout)
+				defer cancelPreflight()
 
-						GinkgoWriter.Printf("NodeHealthCheck %q already exists; using it as-is\n",
-							sbrparams.NHCDetectOnlyTestName)
-					} else {
-						nhcCreatedByUs = true
+				Expect(nhcsUsingSBRTemplate(preflightCtx)).To(BeEmpty(),
+					"No NodeHealthCheck may reference a %s while detectOnlyMode is Enabled", sbrparams.SBRTemplateKind)
+
+				By(fmt.Sprintf("Verifying no StorageBasedRemediation CR exists for target node %q", targetNodeName))
+
+				// This spec never creates a remediation CR, so it must not delete one owned by
+				// another actor. Allow an earlier spec's terminating CR to disappear on its own.
+				Eventually(func() (bool, error) {
+					staleCR, staleCRErr := pullSBRCR(targetNodeName)
+					if k8serrors.IsNotFound(staleCRErr) {
+						return true, nil
 					}
-				}
+
+					if k8serrors.IsForbidden(staleCRErr) || k8serrors.IsUnauthorized(staleCRErr) {
+						return false, StopTrying("Cannot check the target node's remediation CR").Wrap(staleCRErr)
+					}
+
+					if staleCRErr != nil {
+						return false, fmt.Errorf("checking StorageBasedRemediation/%s: %w", targetNodeName, staleCRErr)
+					}
+
+					if staleCR.GetDeletionTimestamp() == nil {
+						return false, StopTrying(fmt.Sprintf(
+							"StorageBasedRemediation/%s exists and is not terminating", targetNodeName))
+					}
+
+					return false, nil
+				}, medik8sparams.DefaultTimeout, sbrparams.DefaultPollInterval).Should(BeTrue(),
+					"StorageBasedRemediation/%s must be absent before the storage fault is injected", targetNodeName)
 
 				By(fmt.Sprintf("Creating privileged injector pod on target node %q", targetNodeName))
 
@@ -565,22 +626,8 @@ var _ = Describe(
 					"Node %q must reach %s=True after CephFS port injection",
 					targetNodeName, sbrparams.SBRStorageUnhealthyCondition)
 
-				if nhcInstalled {
-					By("Waiting for NHC to create StorageBasedRemediation CR for target node (expected NHC behavior)")
-
-					Eventually(func() error {
-						getErr := sbrCRExists(targetNodeName)
-						if k8serrors.IsNotFound(getErr) {
-							return fmt.Errorf("StorageBasedRemediation/%s not yet created by NHC", targetNodeName)
-						}
-
-						return getErr
-					}, sbrparams.NHCSBRCRCreationTimeout, sbrparams.NHCSBRCRCreationPollInterval).Should(Succeed(),
-						"NHC must create StorageBasedRemediation CR for target node %q", targetNodeName)
-				}
-
-				By(fmt.Sprintf("Consistently asserting node %q is not cordoned or fenced while detectOnlyMode is Enabled",
-					targetNodeName))
+				By(fmt.Sprintf("Consistently asserting node %q is not cordoned, fenced, or remediated "+
+					"while detectOnlyMode is Enabled", targetNodeName))
 
 				Consistently(func() error {
 					node, nodeErr := APIClient.CoreV1Interface.Nodes().Get(
@@ -603,38 +650,17 @@ var _ = Describe(
 						}
 					}
 
-					if nhcInstalled {
-						// The SBR CR may exist (NHC creates it — that is correct and expected).
-						// Assert the controller has not set FencingSucceeded=True on it.
-						sbrCR := &unstructured.Unstructured{}
-						sbrCR.SetAPIVersion(sbrparams.CRDGroup + "/" + sbrparams.CRDVersion)
-						sbrCR.SetKind("StorageBasedRemediation")
+					// Nothing in this spec requests remediation, so a StorageBasedRemediation CR
+					// means another actor (for example a leftover NHC) is remediating the node.
+					crErr := sbrCRExists(targetNodeName)
+					if crErr == nil {
+						return fmt.Errorf(
+							"StorageBasedRemediation/%s exists — no remediation may be requested in detect-only mode",
+							targetNodeName)
+					}
 
-						if crGetErr := APIClient.Get(context.TODO(),
-							types.NamespacedName{Name: targetNodeName, Namespace: medik8sparams.OperatorNs},
-							sbrCR); crGetErr == nil {
-							conditions, _, _ := unstructured.NestedSlice(sbrCR.Object, "status", "conditions")
-							for _, c := range conditions {
-								condMap, ok := c.(map[string]interface{})
-								if !ok {
-									continue
-								}
-
-								if condMap["type"] == sbrparams.FencingInProgressCondition &&
-									condMap["status"] == string(corev1.ConditionTrue) {
-									return fmt.Errorf(
-										"StorageBasedRemediation CR has FencingInProgress=True — " +
-											"controller must not start fencing in detect-only mode")
-								}
-
-								if condMap["type"] == sbrparams.FencingSucceededCondition &&
-									condMap["status"] == string(corev1.ConditionTrue) {
-									return fmt.Errorf(
-										"StorageBasedRemediation CR has FencingSucceeded=True — " +
-											"controller must not fence in detect-only mode")
-								}
-							}
-						}
+					if !k8serrors.IsNotFound(crErr) {
+						return fmt.Errorf("failed to check StorageBasedRemediation/%s: %w", targetNodeName, crErr)
 					}
 
 					return nil
@@ -643,57 +669,18 @@ var _ = Describe(
 						"Node %q must remain Ready and schedulable for %s while detectOnlyMode is Enabled",
 						targetNodeName, sbrparams.DetectOnlySuppressionCheckDuration)
 
-				By("Removing CephFS REJECT rules before toggling detectOnlyMode to avoid a real fence cycle")
+				// Delete the SBRC while detectOnlyMode is still Enabled: no agent pod is restarted on
+				// the faulted node, and no agent can arm the watchdog after the fault.
+				By("Removing CephFS REJECT rules")
 
 				for _, rule := range cephFSFlushBidirectional {
 					_, flushErr := injectorPod.ExecCommand(rule)
-					Expect(flushErr).ToNot(HaveOccurred(),
-						"iptables flush must succeed before toggling detectOnlyMode to Disabled")
+					Expect(flushErr).ToNot(HaveOccurred(), "iptables flush must succeed")
 				}
 
 				if _, delErr := injectorPod.Delete(); delErr != nil && !k8serrors.IsNotFound(delErr) {
 					GinkgoWriter.Printf("Warning: delete injector pod %s: %v\n", injectorPodName, delErr)
 				}
-
-				By("Patching StorageBasedRemediationConfig to detectOnlyMode: Disabled")
-
-				patchTarget := &unstructured.Unstructured{}
-				patchTarget.SetGroupVersionKind(detectOnlySBRC.GroupVersionKind())
-				patchTarget.SetName(sbrparams.SBRCDetectOnlyTestName)
-				patchTarget.SetNamespace(medik8sparams.OperatorNs)
-				patchErr := APIClient.Patch(context.TODO(), patchTarget,
-					client.RawPatch(types.MergePatchType, []byte(`{"spec":{"detectOnlyMode":"Disabled"}}`)))
-				Expect(patchErr).ToNot(HaveOccurred(),
-					"Patching StorageBasedRemediationConfig detectOnlyMode to Disabled must succeed")
-
-				By("Verifying detectOnlyMode is now Disabled in the StorageBasedRemediationConfig spec")
-
-				Eventually(func() error {
-					freshSBRC := &unstructured.Unstructured{}
-					freshSBRC.SetGroupVersionKind(detectOnlySBRC.GroupVersionKind())
-
-					if fetchErr := APIClient.Get(context.TODO(),
-						types.NamespacedName{Name: sbrparams.SBRCDetectOnlyTestName, Namespace: medik8sparams.OperatorNs},
-						freshSBRC); fetchErr != nil {
-						return fmt.Errorf("failed to fetch StorageBasedRemediationConfig: %w", fetchErr)
-					}
-
-					currentMode, mFound, mErr := unstructured.NestedString(freshSBRC.Object, "spec", "detectOnlyMode")
-					if mErr != nil {
-						return fmt.Errorf("reading spec.detectOnlyMode: %w", mErr)
-					}
-
-					if !mFound || currentMode != "Disabled" {
-						return fmt.Errorf("detectOnlyMode is %q, want Disabled", currentMode)
-					}
-
-					return nil
-				}, medik8sparams.DefaultTimeout, sbrparams.DefaultPollInterval).Should(Succeed(),
-					"StorageBasedRemediationConfig detectOnlyMode must reflect Disabled after patch")
-
-				By("Verifying agent DaemonSet remains ready after toggling detectOnlyMode to Disabled")
-
-				waitForSBRCReady(sbrparams.SBRCDetectOnlyTestName)
 
 				By("Deleting the StorageBasedRemediationConfig")
 

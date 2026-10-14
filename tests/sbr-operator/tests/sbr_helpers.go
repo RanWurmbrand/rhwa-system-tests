@@ -16,6 +16,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -204,6 +205,32 @@ func isNHCCRDInstalled() bool {
 	return false
 }
 
+// nhcsUsingSBRTemplate returns the names of NodeHealthChecks that use SBR as a remediator,
+// directly or through an escalating remediation. Returns (nil, nil) when the NHC API is not
+// registered, and a wrapped error for any other list failure.
+func nhcsUsingSBRTemplate(ctx context.Context) ([]string, error) {
+	nhcList := &unstructured.UnstructuredList{}
+	nhcList.SetAPIVersion(sbrparams.NHCAPIGroup + "/" + sbrparams.NHCAPIVersion)
+	nhcList.SetKind("NodeHealthCheckList")
+	if err := APIClient.List(ctx, nhcList); err != nil {
+		if meta.IsNoMatchError(err) || k8serrors.IsNotFound(err) {
+			return nil, nil
+		}
+
+		return nil, fmt.Errorf("listing NodeHealthChecks: %w", err)
+	}
+
+	var names []string
+
+	for idx := range nhcList.Items {
+		if helpers.NHCReferencesTemplateKind(nhcList.Items[idx].Object, sbrparams.SBRTemplateKind) {
+			names = append(names, nhcList.Items[idx].GetName())
+		}
+	}
+
+	return names, nil
+}
+
 // ensureSBRTemplate creates the StorageBasedRemediationTemplate referenced by every SBR
 // NodeHealthCheck when it does not already exist. The SBR operator does not create it (the
 // sample only lives in the CSV alm-examples), and without it NHC disables itself with
@@ -214,7 +241,7 @@ func ensureSBRTemplate() {
 	template := &unstructured.Unstructured{
 		Object: map[string]interface{}{
 			"apiVersion": sbrparams.CRDGroup + "/" + sbrparams.CRDVersion,
-			"kind":       "StorageBasedRemediationTemplate",
+			"kind":       sbrparams.SBRTemplateKind,
 			"metadata": map[string]interface{}{
 				"name":      sbrparams.SBRTemplateName,
 				"namespace": medik8sparams.OperatorNs,
@@ -279,7 +306,7 @@ func buildNHC(name string) *unstructured.Unstructured {
 				},
 				"remediationTemplate": map[string]interface{}{
 					"apiVersion": sbrparams.CRDGroup + "/" + sbrparams.CRDVersion,
-					"kind":       "StorageBasedRemediationTemplate",
+					"kind":       sbrparams.SBRTemplateKind,
 					"name":       sbrparams.SBRTemplateName,
 					"namespace":  medik8sparams.OperatorNs,
 				},

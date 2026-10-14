@@ -284,12 +284,17 @@ The SBR test suite is organized in the `/tests/sbr-operator/tests/` directory wi
 - **Requirement**: ReadWriteMany (RWX) access mode
 
 #### Test ID: 88876 - Detection-Only Mode (detect_only.go)
-**Purpose**: RHWA-1068 regression - agent pods reach Ready despite /dev/watchdog held
+**Purpose**: Verify detect-only configuration, storage-fault suppression, mode toggle, and agent cleanup
 **Description**:
-- Tests detection-only mode where watchdog cannot be acquired
-- Verifies agents still become Ready
-- Validates monitoring without fencing capability
-**Expected**: Agents reach Ready state even without watchdog access
+- Verifies `detectOnlyMode: Enabled` is reflected in the StorageBasedRemediationConfig
+- Toggles detect-only mode to Disabled and back to Enabled before any fault, verifying each time that the agent DaemonSet rolls out running pods (a toggle restarts every agent pod, and a pod restarted on the faulted node cannot remount CephFS)
+- Requires no NodeHealthCheck to reference SBR directly or through escalating remediations, and waits for any terminating remediation CR for the target node to disappear before injecting the fault
+- Injects a CephFS storage fault and waits for `SBRStorageUnhealthy=True`
+- Verifies the node remains Ready and schedulable and no StorageBasedRemediation CR appears during the suppression window
+- Restores storage connectivity
+- Deletes the configuration and verifies the agent DaemonSet is garbage-collected
+- Leaves remediation CRs owned by other actors untouched, including when the absence preflight fails
+**Expected**: Storage failure is detected without remediation in detect-only mode, the mode toggle succeeds, and configuration deletion removes the agents
 **Storage Class**: 
 - **Auto-discovered RWX**: CephFS-based (searches for provisioner containing "cephfs")
 - **Override**: Set `SBR_STORAGE_CLASS` env var

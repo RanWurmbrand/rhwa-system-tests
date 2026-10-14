@@ -145,6 +145,9 @@ const (
 	// SBRTemplateName is the name of the StorageBasedRemediationTemplate that NHC references.
 	SBRTemplateName = "storagebasedremediationtemplate-sample"
 
+	// SBRTemplateKind is the kind a NodeHealthCheck references to use SBR as its remediator.
+	SBRTemplateKind = "StorageBasedRemediationTemplate"
+
 	// NHCUnhealthyDuration is how long a node must hold SBRStorageUnhealthy=True before NHC acts.
 	NHCUnhealthyDuration = "30s"
 
@@ -186,9 +189,6 @@ const (
 
 	// SBRCDetectOnlyTestName is the SBRC name used in the detectOnlyMode test (OCP-88876).
 	SBRCDetectOnlyTestName = "test-sbrc-detect-only"
-
-	// NHCDetectOnlyTestName is the NHC CR name used in the detect-only suppression test.
-	NHCDetectOnlyTestName = "nhc-sbr-detect-only"
 
 	// WatchdogKeepaliveNamePrefix is the name prefix for privileged pods that hold /dev/watchdog
 	// open during the RHWA-1068 regression test.
