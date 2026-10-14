@@ -1,8 +1,11 @@
 package tests
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"strings"
 
@@ -85,6 +88,9 @@ func checkSNRRunning() (bool, int) {
 	return runningCount > 0, runningCount
 }
 
+// sbdHeartbeatMsgType is SBD_MSG_TYPE_HEARTBEAT from internal/sbdprotocol.
+const sbdHeartbeatMsgType byte = 0x01
+
 // SlotData represents a single heartbeat slot entry from the SBR device.
 type SlotData struct {
 	NodeID    uint16
@@ -96,16 +102,27 @@ type SlotData struct {
 // readSlotDataFromPod reads slot data from an SBR agent pod by executing
 // dd to read the block device and parsing the heartbeat messages.
 func readSlotDataFromPod(podName, namespace string) ([]SlotData, error) {
-	// Read first 255 slots (255 * 512 bytes = 130560 bytes)
-	// Each slot is 512 bytes and contains a heartbeat message
+	// Heartbeat slots live in the heartbeat region, not at the start of the device.
+	// Layout (internal/blockformat/superblock.go): heartbeat region starts at
+	// BlockHeartbeatRegionOffset (135168) and holds BlockMaxNodes (255) slots of
+	// BlockSlotSize (4096) bytes each. 135168 / 4096 == 33, so skip 33 blocks.
+	// iflag=direct bypasses the page cache so peer writes are actually observed.
 	sbrDevicePath := "/sbr-block"
-	cmd := []string{"dd", "if=" + sbrDevicePath, "bs=512", "count=255", "status=none"}
+	cmd := []string{
+		"dd", "if=" + sbrDevicePath,
+		"bs=4096", "skip=33", "count=255",
+		"iflag=direct", "status=none",
+	}
 	podBuilder, err := pod.Pull(APIClient, podName, namespace)
 	if err != nil {
 		return nil, fmt.Errorf("failed to pull pod %s: %w", podName, err)
 	}
 
-	output, err := podBuilder.ExecCommand(cmd, "")
+	// TTY must be off: a pseudo-terminal translates every 0x0A byte into 0x0D 0x0A
+	// on output, which shifts the raw device bytes and corrupts the slot layout.
+	isTTY := false
+
+	output, err := podBuilder.ExecCommandWithOptions(cmd, &pod.ExecOptions{TTY: &isTTY})
 	if err != nil {
 		return nil, fmt.Errorf("failed to exec dd command in pod %s: %w", podName, err)
 	}
@@ -116,53 +133,58 @@ func readSlotDataFromPod(podName, namespace string) ([]SlotData, error) {
 	return slots, nil
 }
 
-// parseSlotData parses raw block device bytes into SlotData entries.
+// parseSlotData parses raw heartbeat-region bytes into SlotData entries.
+//
+// Each slot is BlockSlotSize (4096) bytes and starts with a packed 33-byte SBD
+// message header, little-endian throughout
+// (internal/sbdprotocol/message.go Marshal):
+//
+//	[0:8]   Magic "SBDMSG01"
+//	[8:10]  Version   uint16
+//	[10]    Type      byte (0x01 heartbeat, 0x02 fence)
+//	[11:13] NodeID    uint16
+//	[13:21] Timestamp uint64 (UnixNano)
+//	[21:29] Sequence  uint64
+//	[29:33] Checksum  uint32 (CRC32 over bytes 0:29)
+//
+// The slot for node N is at index N-1 in Block mode, so the returned SlotData
+// carries the NodeID read from the payload rather than the slot index.
 func parseSlotData(data []byte) []SlotData {
-	const slotSize = 512
+	const (
+		slotSize   = 4096
+		headerSize = 33
+		maxNodes   = 255
+	)
+
+	sbdMagic := []byte("SBDMSG01")
+
 	var slots []SlotData
 
-	// Each 512-byte slot contains:
-	// - Magic bytes at the start (to identify valid entries)
-	// - NodeID (2 bytes)
-	// - Timestamp (8 bytes)
-	// - Sequence (8 bytes)
-	// - Other metadata
+	for i := 0; i < len(data)/slotSize && i < maxNodes; i++ {
+		slotBytes := data[i*slotSize : (i+1)*slotSize][:headerSize]
 
-	for i := 0; i < len(data)/slotSize && i < 255; i++ {
-		offset := i * slotSize
-		slotBytes := data[offset : offset+slotSize]
-
-		// Check if slot has data (non-zero bytes)
-		hasData := false
-		for _, b := range slotBytes[:64] { // Check first 64 bytes
-			if b != 0 {
-				hasData = true
-
-				break
-			}
-		}
-
-		if !hasData {
+		// A slot only counts as written if it carries a valid heartbeat header.
+		if !bytes.Equal(slotBytes[0:8], sbdMagic) {
 			continue
 		}
 
-		// Simple parsing - look for heartbeat pattern
-		// This is a simplified version; actual format may vary
-		slot := SlotData{
-			HasData: hasData,
+		if slotBytes[10] != sbdHeartbeatMsgType {
+			continue
 		}
 
-		// Try to extract NodeID, Timestamp, Sequence from known offsets
-		// Note: These offsets are approximations based on the SBR protocol
-		if len(slotBytes) >= 64 {
-			// NodeID is typically at a fixed offset
-			slot.NodeID = uint16(slotBytes[16])<<8 | uint16(slotBytes[17])
+		want := crc32.ChecksumIEEE(slotBytes[0:29])
+		if got := binary.LittleEndian.Uint32(slotBytes[29:33]); got != want {
+			GinkgoWriter.Printf("  Slot %d: checksum mismatch (got %d, want %d), skipping\n", i, got, want)
 
-			// Timestamp and Sequence would be at other offsets
-			// For now, mark as having data
+			continue
 		}
 
-		slots = append(slots, slot)
+		slots = append(slots, SlotData{
+			NodeID:    binary.LittleEndian.Uint16(slotBytes[11:13]),
+			Timestamp: int64(binary.LittleEndian.Uint64(slotBytes[13:21])),
+			Sequence:  binary.LittleEndian.Uint64(slotBytes[21:29]),
+			HasData:   true,
+		})
 	}
 
 	return slots

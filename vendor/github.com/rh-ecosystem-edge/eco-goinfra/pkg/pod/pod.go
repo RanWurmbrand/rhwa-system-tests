@@ -1590,3 +1590,99 @@ func (builder *Builder) validate() (bool, error) {
 
 	return true, nil
 }
+
+// ExecOptions holds optional settings for ExecCommandWithOptions. A nil
+// *ExecOptions, or a zero-valued one, reproduces ExecCommand's behaviour.
+type ExecOptions struct {
+	// ContainerName selects the container to exec into. Empty means the first container.
+	ContainerName string
+
+	// TTY controls whether the exec session allocates a pseudo-terminal. It
+	// defaults to true to match ExecCommand. Set it to false when the command
+	// emits binary data, because a TTY performs newline translation that
+	// corrupts arbitrary bytes.
+	TTY *bool
+}
+
+// ExecCommandWithOptions runs command in the pod and returns its stdout.
+// It behaves like ExecCommand, but lets the caller override exec settings.
+// Passing nil options is equivalent to calling ExecCommand.
+//
+// Parameters:
+//   - command: the command to execute
+//   - options: optional exec settings; nil selects the ExecCommand defaults
+//
+// Returns:
+//   - bytes.Buffer: the command's stdout
+//   - error: error if the command could not be executed
+func (builder *Builder) ExecCommandWithOptions(
+	command []string, options *ExecOptions) (bytes.Buffer, error) {
+	if valid, err := builder.validate(); !valid {
+		return bytes.Buffer{}, err
+	}
+
+	if !builder.Exists() {
+		klog.V(100).Infof("Cannot execute command on pod %s in namespace %s because it does not exist",
+			builder.Definition.Name, builder.Definition.Namespace)
+
+		return bytes.Buffer{}, fmt.Errorf("pod object %s does not exist in namespace %s",
+			builder.Definition.Name, builder.Definition.Namespace)
+	}
+
+	if options == nil {
+		options = &ExecOptions{}
+	}
+
+	cName := options.ContainerName
+	if cName == "" {
+		cName = builder.Definition.Spec.Containers[0].Name
+	}
+
+	tty := true
+	if options.TTY != nil {
+		tty = *options.TTY
+	}
+
+	var buffer bytes.Buffer
+
+	klog.V(100).Infof("Execute command %v in the pod %s container %s in namespace %s (tty=%t)",
+		command, builder.Object.Name, cName, builder.Object.Namespace, tty)
+
+	req := builder.apiClient.CoreV1Interface.RESTClient().
+		Post().
+		Namespace(builder.Object.Namespace).
+		Resource("pods").
+		Name(builder.Object.Name).
+		SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Container: cName,
+			Command:   command,
+			Stdout:    true,
+			Stderr:    true,
+			TTY:       tty,
+		}, scheme.ParameterCodec)
+
+	exec, err := builder.getExecutorFromRequest(
+		req,
+		defaultDialTimeout,
+		defaultTLSHandshakeTimeout,
+		defaultResponseHeaderTimeout,
+	)
+	if err != nil {
+		klog.V(100).Infof("Could not create command executor for pod %s in namespace %s: %v",
+			builder.Definition.Name, builder.Definition.Namespace, err)
+
+		return buffer, err
+	}
+
+	err = exec.StreamWithContext(logging.DiscardContext(), remotecommand.StreamOptions{
+		Stdout: &buffer,
+		Stderr: os.Stderr,
+		Tty:    tty,
+	})
+	if err != nil {
+		return buffer, err
+	}
+
+	return buffer, nil
+}
