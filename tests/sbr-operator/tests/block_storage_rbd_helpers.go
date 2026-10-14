@@ -17,6 +17,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/remotecommand"
 )
 
 // discoverCephRBDStorageClass returns a Ceph RBD block storage class name.
@@ -118,11 +119,27 @@ func readSlotDataFromPod(podName, namespace string) ([]SlotData, error) {
 		return nil, fmt.Errorf("failed to pull pod %s: %w", podName, err)
 	}
 
-	// TTY must be off: a pseudo-terminal translates every 0x0A byte into 0x0D 0x0A
-	// on output, which shifts the raw device bytes and corrupts the slot layout.
-	isTTY := false
+	var output bytes.Buffer
 
-	output, err := podBuilder.ExecCommandWithOptions(cmd, &pod.ExecOptions{TTY: &isTTY})
+	// TTY must stay off: a pseudo-terminal translates every 0x0A byte into 0x0D 0x0A
+	// on output, which shifts the raw device bytes and corrupts the slot layout.
+	// ExecCommand and ExecCommandWithTimeout both force TTY on, so use the
+	// context-based variant that lets the exec options through unchanged.
+	err = podBuilder.ExecCommandWithContext(
+		context.TODO(),
+		corev1.PodExecOptions{
+			Container: podBuilder.Definition.Spec.Containers[0].Name,
+			Command:   cmd,
+			Stdout:    true,
+			Stderr:    true,
+			TTY:       false,
+		},
+		remotecommand.StreamOptions{
+			Stdout: &output,
+			Stderr: os.Stderr,
+			Tty:    false,
+		},
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to exec dd command in pod %s: %w", podName, err)
 	}
