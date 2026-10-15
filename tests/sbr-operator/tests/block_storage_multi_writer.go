@@ -1,7 +1,6 @@
 package tests
 
 import (
-	"context"
 	"fmt"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -15,10 +14,8 @@ import (
 	"github.com/medik8s/system-tests/tests/internal/medik8sparams"
 	"github.com/medik8s/system-tests/tests/sbr-operator/internal/sbrparams"
 
-	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/types"
 )
 
 var _ = Describe(
@@ -26,115 +23,26 @@ var _ = Describe(
 	Ordered,
 	ContinueOnFailure,
 	Label(labels.OperatorSBR), func() {
-		var (
-			testSBRC *unstructured.Unstructured
-		)
+		var testSBRC *unstructured.Unstructured
 
 		BeforeAll(func() {
-			By("Checking if Self Node Remediation (SNR) operator is running")
-			snrRunning, snrPodCount := checkSNRRunning()
-			if snrRunning {
-				Fail(fmt.Sprintf("CANNOT RUN SBR BLOCK STORAGE TEST: Self Node Remediation (SNR) is running with %d pods.\n"+
-					"SNR and SBR cannot both use the watchdog device simultaneously (resource conflict).\n"+
-					"SBR requires detectOnlyMode: disabled (default) which needs exclusive watchdog access.\n\n"+
-					"To run this test, you must scale down SNR:\n"+
-					"  oc scale daemonset self-node-remediation-ds -n openshift-workload-availability --replicas=0\n\n"+
-					"Alternatively, configure SBR with detectOnlyMode: enabled (but this changes test behavior).",
-					snrPodCount))
-			}
-			GinkgoWriter.Printf("✓ SNR is not running - SBR can safely access watchdog device\n")
-
-			By("Discovering Ceph RBD block storage class for Ceph RBD tests")
-			rbdStorageClass, err := discoverCephRBDStorageClass()
-			Expect(err).ToNot(HaveOccurred(), "Failed to discover Ceph RBD StorageClass")
-
-			if rbdStorageClass == "" {
-				Skip("No Ceph RBD StorageClass found; install ODF or set SBR_RBD_STORAGE_CLASS env var")
-			}
-			GinkgoWriter.Printf("Using Ceph RBD StorageClass %q for block storage tests\n", rbdStorageClass)
-
-			By(fmt.Sprintf("Pre-cleaning stale SBRC %q if present", sbrparams.SBRCBlockTestName))
-			staleObj := &unstructured.Unstructured{}
-			staleObj.SetAPIVersion(sbrparams.CRDGroup + "/" + sbrparams.CRDVersion)
-			staleObj.SetKind("StorageBasedRemediationConfig")
-			staleObj.SetName(sbrparams.SBRCBlockTestName)
-			staleObj.SetNamespace(medik8sparams.OperatorNs)
-
-			if delErr := APIClient.Delete(context.TODO(), staleObj); delErr != nil && !k8serrors.IsNotFound(delErr) {
-				GinkgoWriter.Printf("Pre-cleanup: warning deleting stale SBRC %s: %v\n",
-					sbrparams.SBRCBlockTestName, delErr)
-			} else if delErr == nil {
-				Eventually(func() bool {
-					chk := &unstructured.Unstructured{}
-					chk.SetAPIVersion(sbrparams.CRDGroup + "/" + sbrparams.CRDVersion)
-					chk.SetKind("StorageBasedRemediationConfig")
-					getErr := APIClient.Get(context.TODO(),
-						types.NamespacedName{
-							Name:      sbrparams.SBRCBlockTestName,
-							Namespace: medik8sparams.OperatorNs,
-						}, chk)
-
-					return k8serrors.IsNotFound(getErr)
-				}, medik8sparams.DefaultTimeout, sbrparams.DefaultPollInterval).Should(BeTrue(),
-					"Stale SBRC %q must be gone before creating a fresh one",
-					sbrparams.SBRCBlockTestName)
-			}
-
-			By(fmt.Sprintf("Creating StorageBasedRemediationConfig %q with Ceph RBD block storage",
-				sbrparams.SBRCBlockTestName))
-
-			testSBRC = buildSBRC(sbrparams.SBRCBlockTestName, map[string]interface{}{
-				"sharedStorageClass":      rbdStorageClass,
-				"sharedStorageVolumeMode": "Block",
-			})
-			createErr := APIClient.Create(context.TODO(), testSBRC)
-			Expect(createErr).ToNot(HaveOccurred(),
-				"StorageBasedRemediationConfig %q must be created for Ceph RBD block storage test",
-				sbrparams.SBRCBlockTestName)
-
-			By(fmt.Sprintf("Waiting for SBRC %q agent DaemonSet to be ready",
-				sbrparams.SBRCBlockTestName))
-			waitForSBRCReady(sbrparams.SBRCBlockTestName)
+			testSBRC = setupBlockModeSBRC(sbrparams.SBRCBlockTestName)
 		})
 
 		AfterAll(func() {
 			if testSBRC != nil {
-				By(fmt.Sprintf("Removing StorageBasedRemediationConfig %q",
-					sbrparams.SBRCBlockTestName))
-
-				if deleteErr := APIClient.Delete(context.TODO(), testSBRC); deleteErr != nil &&
-					!k8serrors.IsNotFound(deleteErr) {
-					GinkgoT().Logf("Warning: cleanup delete SBRC %s: %v",
-						sbrparams.SBRCBlockTestName, deleteErr)
-				} else {
-					Eventually(func() error {
-						getErr := APIClient.Get(context.TODO(),
-							types.NamespacedName{
-								Name:      sbrparams.SBRCBlockTestName,
-								Namespace: medik8sparams.OperatorNs,
-							},
-							testSBRC.DeepCopy())
-
-						if k8serrors.IsNotFound(getErr) {
-							return nil
-						}
-
-						if getErr != nil {
-							return getErr
-						}
-
-						return fmt.Errorf("SBRC %s still present", sbrparams.SBRCBlockTestName)
-					}, medik8sparams.DefaultTimeout, sbrparams.DefaultPollInterval).Should(Succeed())
-				}
+				By(fmt.Sprintf("Removing StorageBasedRemediationConfig %q", sbrparams.SBRCBlockTestName))
+				deleteSBRCAndWait(testSBRC, sbrparams.SBRCBlockTestName)
 			}
 		})
 
 		It("Verify SBR agents write concurrently to Ceph RBD block device without conflicts",
-			reportxml.ID("TBD"),
+			reportxml.ID("1915"),
 			Label(
 				labels.OperatorSBR,
-				labels.DisruptionNonDestructive,
 				labels.TierAcceptance,
+				labels.ComponentDaemonSet,
+				labels.DisruptionNonDestructive,
 				labels.PlatformAny,
 				labels.FrequencyNightly,
 			), func() {
