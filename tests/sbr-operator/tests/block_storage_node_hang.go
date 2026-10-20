@@ -203,7 +203,9 @@ var _ = Describe(
 				By("Waiting for FencingSucceeded=True and Succeeded=True on the victim's StorageBasedRemediation CR")
 
 				Eventually(func() error {
-					return fencingProven(victimNodeName)
+					_, provenErr := fencingProven(victimNodeName)
+
+					return provenErr
 				}, sbrparams.FencingProvenTimeout, sbrparams.DefaultPollInterval).Should(Succeed(),
 					"StorageBasedRemediation/%s must reach %s=True and %s=True",
 					victimNodeName, sbrparams.FencingSucceededCondition, sbrparams.SucceededCondition)

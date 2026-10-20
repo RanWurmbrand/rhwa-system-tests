@@ -441,6 +441,34 @@ func heartbeatSequences(observerPodName string) (map[uint16]uint64, error) {
 	return sequences, nil
 }
 
+// victimHeartbeatTimestamp reads the heartbeat region through the observer and returns the UnixNano
+// timestamp written in the slot the given node ID owns. The slot is located by position (index
+// nodeID-1, the Block-mode geometry the agent and reconciler share) and must carry that node ID, so a
+// heartbeat written to the wrong offset fails here instead of being found by its payload.
+func victimHeartbeatTimestamp(observerPodName string, victimNodeID uint16) (int64, error) {
+	slots, readErr := readSlotDataFromPod(observerPodName)
+	if readErr != nil {
+		return 0, readErr
+	}
+
+	slotIdx := int(victimNodeID) - 1
+
+	for _, slot := range slots {
+		if slot.SlotIndex != slotIdx {
+			continue
+		}
+
+		if slot.NodeID != victimNodeID {
+			return 0, fmt.Errorf("heartbeat slot at index %d (node ID %d's position) holds node ID %d",
+				slotIdx, victimNodeID, slot.NodeID)
+		}
+
+		return slot.Timestamp, nil
+	}
+
+	return 0, fmt.Errorf("no valid heartbeat at slot index %d for node ID %d", slotIdx, victimNodeID)
+}
+
 // stalledNodeIDs returns, in ascending order, the node IDs whose heartbeat sequence did not advance
 // between two reads of the region. A node whose slot is missing from the later read counts as
 // stalled too: either way it is not writing.

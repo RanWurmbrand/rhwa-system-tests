@@ -512,6 +512,22 @@ const (
 	// buffer's checksum, so a first attempt failing says nothing about the device.
 	BlockNodeMapReadAttempts = 5
 
+	// SBRCBlockSplitBrainTestName is the SBRC name for the Ceph RBD block-mode split-brain test (RHWA-1934).
+	SBRCBlockSplitBrainTestName = "test-sbrc-block-split-brain"
+
+	// NHCBlockSplitBrainTestName is the NodeHealthCheck CR name for the block-mode split-brain test (RHWA-1934).
+	NHCBlockSplitBrainTestName = "nhc-sbr-block-split-brain"
+
+	// BlockSplitBrainInjectorPodName is the privileged pod that blocks Ceph traffic on the victim node
+	// for the whole split-brain scenario, so the one storage-isolated node is fenced while its peers
+	// keep their device access.
+	BlockSplitBrainInjectorPodName = "sbr-rbd-split-brain-injector"
+
+	// MinWorkersForBlockSplitBrain is the number of schedulable worker nodes the split-brain test
+	// needs: one victim (which must not host an SBR controller pod) plus at least two witnesses, so a
+	// single spurious fence stands out against more than one untouched peer.
+	MinWorkersForBlockSplitBrain = 3
+
 	// BlockInspectionMaxSkew bounds how old the newest heartbeat on the device may look from the
 	// machine running the test. It is deliberately loose: its job is to catch a device nobody is
 	// writing to any more, not to measure cadence, which BlockHeartbeatSlotMaxAge does on

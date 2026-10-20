@@ -420,3 +420,46 @@ Full test case: [docs/TESTCASES/rhwa-1931.md](../../docs/TESTCASES/rhwa-1931.md)
   and `Succeeded=True`; the node carries the `node.kubernetes.io/out-of-service` taint, then returns
   Ready with a changed boot-id and a Ready agent pod; the boot-id holds steady for 90s; NHC deletes
   the CR and the node becomes schedulable with the taint gone
+
+### 18. Verify Split-Brain Prevention on Ceph RBD Block Storage ([RHWA-1934](https://issues.redhat.com/browse/RHWA-1934))
+
+Proves that Block-mode fencing hits only the storage-isolated node. A privileged injector pod blocks
+outbound Ceph traffic (ports 3300, 6789, 6800–7300) on one victim worker while its peers keep their
+device access. A peer sets `SBRStorageUnhealthy=True` (reason `HeartbeatTimeout`) on the victim; NHC
+creates a `StorageBasedRemediation` CR; a peer agent fences it; and the reconciler proves death from
+storage, applies the `node.kubernetes.io/out-of-service` taint, and sets `FencingSucceeded=True` /
+`Succeeded=True`. The victim reboots, rejoins, and is uncordoned with the taint removed once NHC
+deletes the CR.
+
+Everything else is a witness assertion: for 60s no witness is flagged unhealthy or gets a CR, and
+after the fence every witness stays Ready, schedulable, on its original boot-id, with the same agent
+pod, restart count and `sbr_self_fenced_total`. The victim's heartbeat node ID is looked up in the
+on-device node map through an observer agent on a witness, its slot is read at index nodeID-1, and the
+`FencingSucceeded` transition is asserted to be later than the victim's last recorded heartbeat —
+death cannot be proven before the node went silent.
+
+The block-mode counterpart of the Filesystem split-brain test (`split_brain.go`, OCP-88877), with its
+own ID. The CR is looked up by node name on every poll because it can be recreated when
+`SBRStorageUnhealthy` cycles to `Unknown`; `FencingInProgress` is deliberately not asserted because
+the 60s fencing window and 60s staleness threshold make it flap.
+
+Full test case: [docs/TESTCASES/rhwa-1934.md](../../docs/TESTCASES/rhwa-1934.md)
+
+- **Operators**: SBR v5.8.0, NHC (skips when the NodeHealthCheck CRD is absent)
+- **Cluster**: Multi-node, at least 3 schedulable workers not hosting an SBR controller pod (one
+  victim and at least two witnesses); skips otherwise
+- **Storage**: ODF Ceph RBD StorageClass, RWX, `volumeMode: Block`. Auto-discovered by
+  provisioner (`rbd.csi.ceph.com`); `SBR_RBD_STORAGE_CLASS` overrides it. Skips when the
+  cluster has none
+- **Environment**: Connected or disconnected; `SBR_INJECTOR_IMAGE` must be mirrored when
+  disconnected. **Destructive** — one worker is cut off from Ceph, fenced and rebooted. Self Node
+  Remediation must not be running. Skips when another `NodeHealthCheck` already remediates through
+  the SBR template
+- **Standalone**: `ginkgo --label-filter="sbr" --focus="only the storage-isolated Ceph RBD node is fenced" ./tests/sbr-operator/...`
+- **Pass criteria**: victim reaches `SBRStorageUnhealthy=True` (reason `HeartbeatTimeout`); for 60s no
+  witness is flagged unhealthy or gets a CR; NHC creates exactly one `StorageBasedRemediation` CR for
+  the victim; it reaches `FencingSucceeded=True` / `Succeeded=True` with the transition later than the
+  victim's last heartbeat, and the victim carries the `out-of-service` taint; every witness stays
+  Ready, schedulable, same boot-id, unchanged `sbr_self_fenced_total`; the victim returns Ready with a
+  changed boot-id and a Ready agent pod, holds steady for 90s, then NHC deletes the CR and the node
+  becomes schedulable with the taint gone

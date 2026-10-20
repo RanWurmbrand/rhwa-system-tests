@@ -663,6 +663,32 @@ func getSBRCRCondition(sbrObj *unstructured.Unstructured, condType string) map[s
 	return nil
 }
 
+// fencingSucceededTransitionTime returns the lastTransitionTime of the FencingSucceeded condition on
+// the given StorageBasedRemediation CR.
+func fencingSucceededTransitionTime(sbrCR *unstructured.Unstructured) (time.Time, error) {
+	nodeName := sbrCR.GetName()
+
+	cond := getSBRCRCondition(sbrCR, sbrparams.FencingSucceededCondition)
+	if cond == nil {
+		return time.Time{}, fmt.Errorf("StorageBasedRemediation/%s has no %s condition yet",
+			nodeName, sbrparams.FencingSucceededCondition)
+	}
+
+	raw, _, _ := unstructured.NestedString(cond, "lastTransitionTime")
+	if raw == "" {
+		return time.Time{}, fmt.Errorf("StorageBasedRemediation/%s %s has no lastTransitionTime",
+			nodeName, sbrparams.FencingSucceededCondition)
+	}
+
+	transition, parseErr := time.Parse(time.RFC3339, raw)
+	if parseErr != nil {
+		return time.Time{}, fmt.Errorf("parse %s lastTransitionTime %q: %w",
+			sbrparams.FencingSucceededCondition, raw, parseErr)
+	}
+
+	return transition, nil
+}
+
 // agentPodCountMatchesWorkerCount reports whether the number of running SBR agent
 // pods equals the worker node count. It returns the result along with the actual and
 // expected counts so the caller can assert and compose its own failure message.
@@ -1414,24 +1440,26 @@ func uncordonNodeIfNeeded(nodeName string) {
 // can be deleted and recreated mid-remediation when the node's SBRStorageUnhealthy condition cycles to
 // Unknown; a transient NotFound is therefore just "keep waiting". The CR persists after the conditions
 // are set (NHC only deletes it once the node recovers), so there is no "proven then deleted" race to
-// special-case here. Intended as an Eventually body.
-func fencingProven(nodeName string) error {
+// special-case here. The CR as seen at the moment it was proven is returned, so callers can inspect
+// it without re-pulling a CR that NHC may delete once the node recovers. Intended as an Eventually
+// body.
+func fencingProven(nodeName string) (*unstructured.Unstructured, error) {
 	sbrCR, pullErr := pullSBRCR(nodeName)
 	if pullErr != nil {
 		if k8serrors.IsNotFound(pullErr) {
-			return fmt.Errorf("StorageBasedRemediation/%s not present yet "+
+			return nil, fmt.Errorf("StorageBasedRemediation/%s not present yet "+
 				"(it may be recreated as the node's condition cycles)", nodeName)
 		}
 
-		return fmt.Errorf("get StorageBasedRemediation/%s: %w", nodeName, pullErr)
+		return nil, fmt.Errorf("get StorageBasedRemediation/%s: %w", nodeName, pullErr)
 	}
 
 	if conditionTrue(sbrCR, sbrparams.FencingSucceededCondition) &&
 		conditionTrue(sbrCR, sbrparams.SucceededCondition) {
-		return nil
+		return sbrCR, nil
 	}
 
-	return fmt.Errorf("StorageBasedRemediation/%s: %s and %s are not both True yet",
+	return nil, fmt.Errorf("StorageBasedRemediation/%s: %s and %s are not both True yet",
 		nodeName, sbrparams.FencingSucceededCondition, sbrparams.SucceededCondition)
 }
 
