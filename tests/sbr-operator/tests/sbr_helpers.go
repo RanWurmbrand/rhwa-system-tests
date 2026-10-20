@@ -522,6 +522,19 @@ func buildNHC(name string) *unstructured.Unstructured {
 	}
 }
 
+// buildNHCWithMaxUnhealthy returns the same SBR NodeHealthCheck as buildNHC but gated on maxUnhealthy
+// instead of minHealthy, so a fixed number of nodes may be unhealthy regardless of cluster size
+// (minHealthy: "51%" blocks any remediation on a 2-worker cluster). It delegates to buildNHC and swaps
+// the health field, so the two stay in sync on selector, template and unhealthyConditions.
+func buildNHCWithMaxUnhealthy(name string, maxUnhealthy int) *unstructured.Unstructured {
+	nhc := buildNHC(name)
+	spec, _ := nhc.Object["spec"].(map[string]interface{})
+	delete(spec, "minHealthy")
+	spec["maxUnhealthy"] = int64(maxUnhealthy)
+
+	return nhc
+}
+
 // cleanupNHCCR deletes the named NodeHealthCheck CR, retrying until it is gone.
 // The NHC webhook rejects deletion while the NHC has an ongoing remediation, so
 // call this after the injected storage fault is removed; NHC then ends the
@@ -538,6 +551,30 @@ func cleanupNHCCR(ctx context.Context, name string) {
 		AddReportEntry("sbr-nhc-cleanup-failed",
 			fmt.Sprintf("NodeHealthCheck %s still exists and may remediate nodes in later specs", name))
 	}
+}
+
+// deleteNHCAndWait deletes the named NodeHealthCheck CR and blocks until it is fully gone. The NHC
+// operator uses finalizers, so a terminating CR from a prior run must be waited out before a fresh one
+// is created under the same name. Safe to call when the CR does not exist.
+func deleteNHCAndWait(name string) {
+	cleanupNHCCR(context.Background(), name)
+	nhc := &unstructured.Unstructured{}
+	nhc.SetAPIVersion(sbrparams.NHCAPIGroup + "/" + sbrparams.NHCAPIVersion)
+	nhc.SetKind("NodeHealthCheck")
+
+	Eventually(func() error {
+		getErr := APIClient.Get(context.TODO(), types.NamespacedName{Name: name}, nhc)
+		if k8serrors.IsNotFound(getErr) {
+			return nil
+		}
+
+		if getErr != nil {
+			return getErr
+		}
+
+		return fmt.Errorf("NodeHealthCheck %s still terminating", name)
+	}, sbrparams.SBRCReadyTimeout, sbrparams.DefaultPollInterval).Should(Succeed(),
+		"NodeHealthCheck %q must be fully removed before a fresh one is created", name)
 }
 
 // pickTargetWorkerNode returns the first schedulable worker node that does not host an SBR controller pod.
