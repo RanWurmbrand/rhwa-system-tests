@@ -1273,3 +1273,112 @@ func waitForInjectionReboot(injectorPodName string) bool {
 
 	return rebooted
 }
+
+// sbrcConcurrentWriteable reports status.storageValidation.concurrentWriteable on the SBRC, the gate
+// the reconciler reads before it will fence anything. The operator sets it once min(2, desired)
+// agents are Ready; the status write can lag the DaemonSet becoming ready, so callers poll it rather
+// than read it once.
+func sbrcConcurrentWriteable(sbrcName string) (bool, error) {
+	sbrc := buildSBRC(sbrcName, map[string]interface{}{})
+	if getErr := APIClient.Get(context.TODO(),
+		types.NamespacedName{Name: sbrcName, Namespace: medik8sparams.OperatorNs}, sbrc); getErr != nil {
+		return false, fmt.Errorf("get SBRC %s: %w", sbrcName, getErr)
+	}
+
+	writeable, _, nestedErr := unstructured.NestedBool(
+		sbrc.Object, "status", "storageValidation", "concurrentWriteable")
+
+	return writeable, nestedErr
+}
+
+// startPrivilegedInjectorPod starts a long-running privileged host-PID pod on nodeName for callers
+// that need to exec into the host namespaces. A pod left behind by a previous run is removed first.
+func startPrivilegedInjectorPod(nodeName, podName string) (*pod.Builder, error) {
+	deleteHostCommandPod(podName)
+
+	return pod.NewBuilder(APIClient, podName, medik8sparams.OperatorNs, sbrparams.InjectorImage).
+		DefineOnNode(nodeName).
+		WithHostPid(true).
+		WithPrivilegedFlag().
+		CreateAndWaitUntilRunning(medik8sparams.DefaultTimeout)
+}
+
+// sysRqTriggerWritable probes, through the injector pod, that nsenter into PID 1 works and that
+// /proc/sysrq-trigger is writable on the host. The probe output is returned alongside the error so
+// the caller can report it.
+func sysRqTriggerWritable(injectorPod *pod.Builder) (string, error) {
+	probeOut, probeErr := injectorPod.ExecCommand([]string{
+		"nsenter", "-t", "1", "--pid", "--mount", "--", "sh", "-c",
+		"test -w /proc/sysrq-trigger",
+	})
+
+	return probeOut.String(), probeErr
+}
+
+// fireSysRqKernelPanic crashes the injector pod's host node through the SysRq trigger. The exec is
+// fire-and-forget: the node reboots immediately, so the command never returns cleanly.
+func fireSysRqKernelPanic(injectorPod *pod.Builder) {
+	_, _ = injectorPod.ExecCommand([]string{
+		"nsenter", "-t", "1", "--pid", "--mount", "--", "sh", "-c",
+		"echo 1 > /proc/sys/kernel/sysrq && echo c > /proc/sysrq-trigger",
+	})
+}
+
+// uncordonNodeIfNeeded clears the unschedulable flag on a node that is still cordoned. Failures are
+// logged rather than asserted so teardown never masks the test result.
+func uncordonNodeIfNeeded(nodeName string) {
+	node, getErr := APIClient.CoreV1Interface.Nodes().Get(context.TODO(), nodeName, metav1.GetOptions{})
+	if getErr != nil {
+		GinkgoWriter.Printf("Warning: get node %s to uncordon: %v\n", nodeName, getErr)
+
+		return
+	}
+
+	if !node.Spec.Unschedulable {
+		return
+	}
+
+	patch := []byte(`{"spec":{"unschedulable":false}}`)
+	if _, patchErr := APIClient.CoreV1Interface.Nodes().Patch(
+		context.TODO(), nodeName, types.MergePatchType, patch, metav1.PatchOptions{}); patchErr != nil {
+		GinkgoWriter.Printf("Warning: uncordon node %s: %v\n", nodeName, patchErr)
+	}
+}
+
+// fencingProven returns nil once the victim's StorageBasedRemediation CR reports both
+// FencingSucceeded=True and Succeeded=True. The CR is looked up by node name on every call because it
+// can be deleted and recreated mid-remediation when the node's SBRStorageUnhealthy condition cycles to
+// Unknown; a transient NotFound is therefore just "keep waiting". The CR persists after the conditions
+// are set (NHC only deletes it once the node recovers), so there is no "proven then deleted" race to
+// special-case here. Intended as an Eventually body.
+func fencingProven(nodeName string) error {
+	sbrCR, pullErr := pullSBRCR(nodeName)
+	if pullErr != nil {
+		if k8serrors.IsNotFound(pullErr) {
+			return fmt.Errorf("StorageBasedRemediation/%s not present yet "+
+				"(it may be recreated as the node's condition cycles)", nodeName)
+		}
+
+		return fmt.Errorf("get StorageBasedRemediation/%s: %w", nodeName, pullErr)
+	}
+
+	if conditionTrue(sbrCR, sbrparams.FencingSucceededCondition) &&
+		conditionTrue(sbrCR, sbrparams.SucceededCondition) {
+		return nil
+	}
+
+	return fmt.Errorf("StorageBasedRemediation/%s: %s and %s are not both True yet",
+		nodeName, sbrparams.FencingSucceededCondition, sbrparams.SucceededCondition)
+}
+
+// conditionTrue reports whether the named status condition on an SBR CR is present and True.
+func conditionTrue(sbrCR *unstructured.Unstructured, condType string) bool {
+	cond := getSBRCRCondition(sbrCR, condType)
+	if cond == nil {
+		return false
+	}
+
+	status, _, _ := unstructured.NestedString(cond, "status")
+
+	return status == string(corev1.ConditionTrue)
+}
