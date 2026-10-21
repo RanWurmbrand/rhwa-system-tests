@@ -367,6 +367,8 @@ func fetchAgentMetrics(agentPodName string) (string, error) {
 
 // readAgentCounter returns the sum of every sample of metricName on an SBR agent pod's own metrics
 // endpoint.
+//
+//nolint:unparam // metricName is kept explicit so callers read at the call site which counter they sample.
 func readAgentCounter(agentPodName, metricName string) (float64, error) {
 	body, fetchErr := fetchAgentMetrics(agentPodName)
 	if fetchErr != nil {
