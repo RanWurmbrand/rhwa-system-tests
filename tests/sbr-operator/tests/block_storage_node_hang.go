@@ -172,7 +172,6 @@ var _ = Describe(
 
 				By(fmt.Sprintf("Triggering a kernel panic on node %q via /proc/sysrq-trigger", victimNodeName))
 				GinkgoWriter.Printf("Executing SysRq kernel panic on node %s\n", victimNodeName)
-
 				fireSysRqKernelPanic(injectorPod)
 
 				By(fmt.Sprintf("Waiting for SBRStorageUnhealthy=True (reason %s) on the victim node",

@@ -3,18 +3,14 @@ package tests
 import (
 	"context"
 	"fmt"
-	"slices"
-	"sort"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	"github.com/rh-ecosystem-edge/eco-goinfra/pkg/pod"
 	"github.com/rh-ecosystem-edge/eco-goinfra/pkg/reportxml"
 
 	"github.com/medik8s/system-tests/tests/internal/labels"
 	. "github.com/medik8s/system-tests/tests/internal/medik8sinittools"
-	"github.com/medik8s/system-tests/tests/internal/medik8sparams"
 	"github.com/medik8s/system-tests/tests/sbr-operator/internal/sbrparams"
 
 	corev1 "k8s.io/api/core/v1"
@@ -22,25 +18,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
-
-// splitBrainState is the victim's heartbeat slot, identified in the on-device node map while the
-// victim is cut off from storage, and the UnixNano timestamp of the last heartbeat it wrote. The
-// timestamp anchors the ordering assertion: fencing may only be proven after the victim actually
-// went silent, so the FencingSucceeded transition must be later than this.
-type splitBrainState struct {
-	victimNodeID uint16
-	heartbeatTS  int64
-}
-
-// splitBrainBaseline is the pre-partition state the test proves the fencing left the witnesses in:
-// their boot-ids and self-fence counters must be untouched when only the victim is isolated.
-type splitBrainBaseline struct {
-	victimBootID    string
-	witnessBootIDs  map[string]string  // witness node name -> boot-id
-	witnessAgents   map[string]string  // witness node name -> its SBR agent pod name
-	witnessFenced   map[string]float64 // witness node name -> sbr_self_fenced_total
-	witnessRestarts map[string]int32   // witness node name -> agent container restart count
-}
 
 var _ = Describe(
 	"SBR Block Storage — Ceph RBD Split-Brain Prevention (Storage Arbitration)",
@@ -72,7 +49,11 @@ var _ = Describe(
 			By(fmt.Sprintf("Selecting a victim and witnesses from the schedulable worker nodes (need at least %d)",
 				sbrparams.MinWorkersForBlockSplitBrain))
 
-			victimNodeName, witnessNodes = pickSplitBrainNodes()
+			var pickErr error
+
+			victimNodeName, witnessNodes, pickErr = splitBrainNodes()
+			Expect(pickErr).ToNot(HaveOccurred(), "Failed to list worker nodes")
+
 			if victimNodeName == "" {
 				Skip(fmt.Sprintf("Need at least %d schedulable worker nodes, one of them not hosting an SBR "+
 					"controller pod", sbrparams.MinWorkersForBlockSplitBrain))
@@ -185,13 +166,78 @@ var _ = Describe(
 				labels.PlatformAny,
 				labels.FrequencyNightly,
 			), func() {
-				baseline := captureSplitBrainBaseline(victimNodeName, witnessNodes)
+				By("Recording the victim node's boot-id before the partition")
+
+				victimBootID, victimBootErr := getNodeBootID(victimNodeName)
+				Expect(victimBootErr).ToNot(HaveOccurred(),
+					"Must read the boot-id of victim node %q before the partition", victimNodeName)
+
+				By("Asserting SBRStorageUnhealthy is not True on the victim node")
+
+				// Absent, False or Unknown all pass; only True is a failed precondition.
+				Expect(transientNodeHasCondition(victimNodeName,
+					sbrparams.SBRStorageUnhealthyCondition, false)).To(Succeed(),
+					"Node %q must not report %s=True before its Ceph traffic is blocked",
+					victimNodeName, sbrparams.SBRStorageUnhealthyCondition)
+
+				By("Recording every witness node's boot-id and its agent's sbr_self_fenced_total counter " +
+					"and restart count")
+
+				baseline, baselineErr := splitBrainBaselineFor(victimBootID, witnessNodes)
+				Expect(baselineErr).ToNot(HaveOccurred(),
+					"Must record the pre-partition baseline of witness nodes %v", witnessNodes)
 
 				By(fmt.Sprintf("Starting a privileged injector pod that blocks Ceph ports on the victim "+
 					"node %q", victimNodeName))
 
-				startSplitBrainPartition(victimNodeName)
-				state := awaitVictimIsolatedWitnessesUntouched(victimNodeName, witnessNodes, observerPodName)
+				injectorPod, injectorErr := startPrivilegedInjectorPod(
+					victimNodeName, sbrparams.BlockSplitBrainInjectorPodName)
+				Expect(injectorErr).ToNot(HaveOccurred(),
+					"Privileged injector pod must start on victim node %q", victimNodeName)
+
+				DeferCleanup(func() {
+					By("DeferCleanup: removing the split-brain injector pod and flushing leftover Ceph " +
+						"REJECT rules")
+					deleteHostCommandPod(sbrparams.BlockSplitBrainInjectorPodName)
+					flushCephRBDRules(victimNodeName)
+				})
+
+				injectOut, injectErr := injectCephRBDRules(injectorPod)
+				Expect(injectErr).ToNot(HaveOccurred(),
+					"Ceph REJECT rules must be inserted on victim node %q (output: %s)",
+					victimNodeName, injectOut)
+				GinkgoWriter.Printf("Ceph port REJECT rules applied on victim node %q only\n", victimNodeName)
+
+				By(fmt.Sprintf("Waiting for SBRStorageUnhealthy=True (reason %s) on the victim node",
+					sbrparams.SBRStorageUnhealthyReasonHeartbeatTimeout))
+
+				Eventually(func() error {
+					return nodeConditionIs(victimNodeName, sbrparams.SBRStorageUnhealthyCondition,
+						corev1.ConditionTrue, sbrparams.SBRStorageUnhealthyReasonHeartbeatTimeout)
+				}, sbrparams.StorageInjectionTimeout, sbrparams.StorageInjectionPollInterval).Should(Succeed(),
+					"A peer must report isolated node %q %s=True (reason %s)",
+					victimNodeName, sbrparams.SBRStorageUnhealthyCondition,
+					sbrparams.SBRStorageUnhealthyReasonHeartbeatTimeout)
+
+				By("Looking up the victim's heartbeat node ID in the node map and recording its last heartbeat")
+
+				state, stateErr := victimHeartbeatSlotState(observerPodName, victimNodeName)
+				Expect(stateErr).ToNot(HaveOccurred(),
+					"Must read the victim's heartbeat slot through observer pod %q", observerPodName)
+				GinkgoWriter.Printf("Victim node %q owns heartbeat slot node ID %d, last heartbeat at %s\n",
+					victimNodeName, state.victimNodeID,
+					time.Unix(0, state.heartbeatTS).UTC().Format(time.RFC3339Nano))
+
+				By(fmt.Sprintf("Consistently asserting for %s that no witness becomes unhealthy or gets "+
+					"an SBR CR", sbrparams.SplitBrainHealthyNodeCheckDuration))
+
+				// Runs while NHC decides to act on the victim. If any witness is flagged or remediated
+				// during this window the fence landed on the wrong geometry and the test fails immediately.
+				Consistently(func() error {
+					return witnessesStillHealthy(witnessNodes)
+				}, sbrparams.SplitBrainHealthyNodeCheckDuration,
+					sbrparams.SplitBrainHealthyNodeCheckInterval).Should(Succeed(),
+					"No witness node must be flagged unhealthy or remediated while only the victim is isolated")
 
 				By("Waiting for NHC to create a StorageBasedRemediation CR for the victim node")
 
@@ -225,7 +271,8 @@ var _ = Describe(
 
 				By("Asserting the FencingSucceeded transition happened after the victim's last heartbeat")
 
-				assertFencingProvenAfterHeartbeat(provenCR, state)
+				Expect(fencingProvenAfterHeartbeat(provenCR, state)).To(Succeed(),
+					"FencingSucceeded for node %q must transition after its last heartbeat", victimNodeName)
 
 				By("Asserting the victim node carries the out-of-service taint")
 
@@ -260,7 +307,9 @@ var _ = Describe(
 
 				By("Asserting every witness node is Ready, schedulable and keeps its original boot-id")
 
-				assertWitnessesUntouched(witnessNodes, baseline)
+				Expect(witnessesUntouched(witnessNodes, baseline)).To(Succeed(),
+					"Only the victim node %q may be fenced; witness nodes %v must be untouched",
+					victimNodeName, witnessNodes)
 
 				By("Waiting for the victim node's agent pod to be Ready again")
 
@@ -336,227 +385,3 @@ var _ = Describe(
 					"witnesses %v untouched\n", victimNodeName, witnessNodes)
 			})
 	})
-
-// pickSplitBrainNodes returns one victim and every other schedulable worker node as a witness. The
-// victim must not host an SBR controller pod, so the fencing reboot does not take the operator down
-// mid-test; witnesses may, since a spurious fence on any worker is exactly what the test looks for.
-// It returns ("", nil) when fewer than MinWorkersForBlockSplitBrain workers are schedulable or none of
-// them can be the victim. The workers are sorted so the victim is chosen deterministically across runs.
-func pickSplitBrainNodes() (string, []string) {
-	controllerNodes := controllerPodNodes()
-	nodeList, err := APIClient.CoreV1Interface.Nodes().List(context.TODO(), metav1.ListOptions{
-		LabelSelector: "node-role.kubernetes.io/worker",
-	})
-	Expect(err).ToNot(HaveOccurred(), "Failed to list worker nodes")
-
-	var schedulable []string
-
-	for nodeIdx := range nodeList.Items {
-		if isNodeSchedulable(&nodeList.Items[nodeIdx]) {
-			schedulable = append(schedulable, nodeList.Items[nodeIdx].Name)
-		}
-	}
-
-	if len(schedulable) < sbrparams.MinWorkersForBlockSplitBrain {
-		return "", nil
-	}
-
-	sort.Strings(schedulable)
-
-	victimIdx := slices.IndexFunc(schedulable, func(name string) bool { return !controllerNodes[name] })
-	if victimIdx < 0 {
-		return "", nil
-	}
-
-	victim := schedulable[victimIdx]
-
-	return victim, slices.Delete(schedulable, victimIdx, victimIdx+1)
-}
-
-// captureSplitBrainBaseline records the victim's boot-id and, for every witness, its boot-id, agent
-// pod name and sbr_self_fenced_total — the state fencing the isolated victim must leave untouched —
-// and asserts the victim starts from a healthy state.
-func captureSplitBrainBaseline(victimNodeName string, witnessNodes []string) splitBrainBaseline {
-	By("Recording the victim node's boot-id before the partition")
-
-	victimBootID, bootErr := getNodeBootID(victimNodeName)
-	Expect(bootErr).ToNot(HaveOccurred(),
-		"Must read the boot-id of victim node %q before the partition", victimNodeName)
-
-	By("Asserting SBRStorageUnhealthy is not True on the victim node")
-
-	// Absent, False or Unknown all pass; only True is a failed precondition.
-	Expect(transientNodeHasCondition(victimNodeName, sbrparams.SBRStorageUnhealthyCondition, false)).To(Succeed(),
-		"Node %q must not report %s=True before its Ceph traffic is blocked",
-		victimNodeName, sbrparams.SBRStorageUnhealthyCondition)
-
-	By("Recording every witness node's boot-id and its agent's sbr_self_fenced_total counter and restart count")
-
-	baseline := splitBrainBaseline{
-		victimBootID:    victimBootID,
-		witnessBootIDs:  make(map[string]string, len(witnessNodes)),
-		witnessAgents:   make(map[string]string, len(witnessNodes)),
-		witnessFenced:   make(map[string]float64, len(witnessNodes)),
-		witnessRestarts: make(map[string]int32, len(witnessNodes)),
-	}
-
-	for _, witness := range witnessNodes {
-		witnessBootID, witnessBootErr := getNodeBootID(witness)
-		Expect(witnessBootErr).ToNot(HaveOccurred(),
-			"Must read the boot-id of witness node %q", witness)
-		baseline.witnessBootIDs[witness] = witnessBootID
-		agentPodName, agentErr := agentPodNameByNode(sbrparams.SBRCBlockSplitBrainTestName, witness, true)
-		Expect(agentErr).ToNot(HaveOccurred(), "An SBR agent pod must be Running on witness node %q", witness)
-		baseline.witnessAgents[witness] = agentPodName
-		selfFenced, metricErr := readAgentCounter(agentPodName, sbrparams.SelfFencedMetricName)
-		Expect(metricErr).ToNot(HaveOccurred(),
-			"Must read %s from witness agent pod %q", sbrparams.SelfFencedMetricName, agentPodName)
-		baseline.witnessFenced[witness] = selfFenced
-		restarts, restartErr := agentRestartCount(agentPodName)
-		Expect(restartErr).ToNot(HaveOccurred(), "Must read the restart count of witness agent pod %q", agentPodName)
-		baseline.witnessRestarts[witness] = restarts
-	}
-
-	return baseline
-}
-
-// startSplitBrainPartition starts a privileged pod on the victim and blocks its Ceph traffic for the
-// whole scenario. The block persists (no self-terminating window) so the victim stays isolated until
-// fencing reboots it, which clears the host's iptables rules. The rules are the same RBD REJECT set
-// the transient partition test uses, so flushCephRBDRules removes exactly what was inserted.
-func startSplitBrainPartition(victimNodeName string) {
-	deleteHostCommandPod(sbrparams.BlockSplitBrainInjectorPodName)
-	injectorPod, createErr := pod.NewBuilder(
-		APIClient, sbrparams.BlockSplitBrainInjectorPodName, medik8sparams.OperatorNs, sbrparams.InjectorImage).
-		DefineOnNode(victimNodeName).
-		WithHostPid(true).
-		WithPrivilegedFlag().
-		CreateAndWaitUntilRunning(medik8sparams.DefaultTimeout)
-	Expect(createErr).ToNot(HaveOccurred(),
-		"Privileged injector pod must start on victim node %q", victimNodeName)
-
-	DeferCleanup(func() {
-		By("DeferCleanup: removing the split-brain injector pod and flushing leftover Ceph REJECT rules")
-		deleteHostCommandPod(sbrparams.BlockSplitBrainInjectorPodName)
-		flushCephRBDRules(victimNodeName)
-	})
-
-	injectOut, injectErr := injectorPod.ExecCommand([]string{"sh", "-c", "set -e\n" + cephRBDRuleScript("-I")})
-	Expect(injectErr).ToNot(HaveOccurred(),
-		"Ceph REJECT rules must be inserted on victim node %q (output: %s)", victimNodeName, injectOut.String())
-	GinkgoWriter.Printf("Ceph port REJECT rules applied on victim node %q only\n", victimNodeName)
-}
-
-// awaitVictimIsolatedWitnessesUntouched waits for a peer to report the victim storage-unhealthy,
-// reads the victim's heartbeat slot through the observer (its node ID and last-written timestamp come
-// from the on-device node map, not the Kubernetes API), and then holds for the healthy-node window
-// proving no witness is dragged into remediation.
-func awaitVictimIsolatedWitnessesUntouched(
-	victimNodeName string, witnessNodes []string, observerPodName string,
-) splitBrainState {
-	By(fmt.Sprintf("Waiting for SBRStorageUnhealthy=True (reason %s) on the victim node",
-		sbrparams.SBRStorageUnhealthyReasonHeartbeatTimeout))
-
-	Eventually(func() error {
-		return nodeConditionIs(victimNodeName, sbrparams.SBRStorageUnhealthyCondition,
-			corev1.ConditionTrue, sbrparams.SBRStorageUnhealthyReasonHeartbeatTimeout)
-	}, sbrparams.StorageInjectionTimeout, sbrparams.StorageInjectionPollInterval).Should(Succeed(),
-		"A peer must report isolated node %q %s=True (reason %s)",
-		victimNodeName, sbrparams.SBRStorageUnhealthyCondition,
-		sbrparams.SBRStorageUnhealthyReasonHeartbeatTimeout)
-
-	By("Looking up the victim's heartbeat node ID in the node map and recording its last heartbeat")
-
-	nodeMap, jsonPayload, mapErr := readNodeMapFromPod(observerPodName)
-	Expect(mapErr).ToNot(HaveOccurred(),
-		"Must read the node map through observer pod %q (payload: %s)", observerPodName, jsonPayload)
-	victimEntry, mapped := nodeMap.Entries[victimNodeName]
-	Expect(mapped).To(BeTrue(),
-		"The node map must hold an entry for victim node %q", victimNodeName)
-	heartbeatTS, tsErr := victimHeartbeatTimestamp(observerPodName, victimEntry.NodeID)
-	Expect(tsErr).ToNot(HaveOccurred(),
-		"Must read the victim's heartbeat slot (node ID %d) through observer pod %q",
-		victimEntry.NodeID, observerPodName)
-	GinkgoWriter.Printf("Victim node %q owns heartbeat slot node ID %d, last heartbeat at %s\n",
-		victimNodeName, victimEntry.NodeID, time.Unix(0, heartbeatTS).UTC().Format(time.RFC3339Nano))
-
-	By(fmt.Sprintf("Consistently asserting for %s that no witness becomes unhealthy or gets an SBR CR",
-		sbrparams.SplitBrainHealthyNodeCheckDuration))
-
-	// Runs while NHC decides to act on the victim. If any witness is flagged or remediated during
-	// this window the fence landed on the wrong geometry and the test fails immediately.
-	Consistently(func() error {
-		for _, witness := range witnessNodes {
-			if condErr := transientNodeHasCondition(witness,
-				sbrparams.SBRStorageUnhealthyCondition, false); condErr != nil {
-				return condErr
-			}
-
-			_, pullErr := pullSBRCR(witness)
-			if pullErr == nil {
-				return fmt.Errorf("witness node %q unexpectedly received a StorageBasedRemediation CR "+
-					"— split-brain isolation is broken", witness)
-			}
-
-			if !k8serrors.IsNotFound(pullErr) {
-				return fmt.Errorf("get StorageBasedRemediation/%s: %w", witness, pullErr)
-			}
-		}
-
-		return nil
-	}, sbrparams.SplitBrainHealthyNodeCheckDuration,
-		sbrparams.SplitBrainHealthyNodeCheckInterval).Should(Succeed(),
-		"No witness node must be flagged unhealthy or remediated while only the victim is isolated")
-
-	return splitBrainState{victimNodeID: victimEntry.NodeID, heartbeatTS: heartbeatTS}
-}
-
-// assertFencingProvenAfterHeartbeat checks that the victim's FencingSucceeded condition transitioned
-// to True only after the last heartbeat it wrote — death is proven from the heartbeat going stale, so
-// the proof cannot predate the silence. It reads the CR snapshot awaitFencingProven returned rather
-// than re-pulling, so NHC deleting the CR after recovery cannot race it.
-func assertFencingProvenAfterHeartbeat(provenCR *unstructured.Unstructured, state splitBrainState) {
-	lastHeartbeat := time.Unix(0, state.heartbeatTS)
-
-	transition, transitionErr := fencingSucceededTransitionTime(provenCR)
-	Expect(transitionErr).ToNot(HaveOccurred(),
-		"Must read the FencingSucceeded transition time from StorageBasedRemediation/%s", provenCR.GetName())
-
-	Expect(transition.After(lastHeartbeat)).To(BeTrue(),
-		"FencingSucceeded for node %q transitioned at %s, which must be after its last heartbeat at %s",
-		provenCR.GetName(), transition.UTC().Format(time.RFC3339), lastHeartbeat.UTC().Format(time.RFC3339Nano))
-}
-
-// assertWitnessesUntouched proves the fence hit only the victim: every witness is Ready, schedulable,
-// still on its original boot-id, and its agent never self-fenced. The agent must also be the same pod
-// with the same restart count, because a restarted or replaced agent starts its counter from zero and
-// would read as "unchanged".
-func assertWitnessesUntouched(witnessNodes []string, baseline splitBrainBaseline) {
-	for _, witness := range witnessNodes {
-		node, getErr := APIClient.CoreV1Interface.Nodes().Get(context.TODO(), witness, metav1.GetOptions{})
-		Expect(getErr).ToNot(HaveOccurred(), "Must read witness node %q for post-fence verification", witness)
-		Expect(isNodeSchedulable(node)).To(BeTrue(),
-			"Witness node %q must remain schedulable while only the victim is fenced", witness)
-		Expect(nodeConditionIs(witness, string(corev1.NodeReady), corev1.ConditionTrue, "")).To(Succeed(),
-			"Witness node %q must stay Ready while only the victim is fenced", witness)
-		Expect(node.Status.NodeInfo.BootID).To(Equal(baseline.witnessBootIDs[witness]),
-			"Witness node %q boot-id must not change (pre=%q, post=%q — it was spuriously fenced)",
-			witness, baseline.witnessBootIDs[witness], node.Status.NodeInfo.BootID)
-		agentPodName, agentErr := agentPodNameByNode(sbrparams.SBRCBlockSplitBrainTestName, witness, true)
-		Expect(agentErr).ToNot(HaveOccurred(), "An SBR agent pod must still be Running on witness node %q", witness)
-		Expect(agentPodName).To(Equal(baseline.witnessAgents[witness]),
-			"Witness node %q agent pod must not be replaced (pre=%q, post=%q)",
-			witness, baseline.witnessAgents[witness], agentPodName)
-		restarts, restartErr := agentRestartCount(agentPodName)
-		Expect(restartErr).ToNot(HaveOccurred(), "Must read the restart count of witness agent pod %q", agentPodName)
-		Expect(restarts).To(Equal(baseline.witnessRestarts[witness]),
-			"Witness agent pod %q must not restart: restart count went from %d to %d",
-			agentPodName, baseline.witnessRestarts[witness], restarts)
-		selfFenced, metricErr := readAgentCounter(baseline.witnessAgents[witness], sbrparams.SelfFencedMetricName)
-		Expect(metricErr).ToNot(HaveOccurred(),
-			"Must read %s from witness agent pod %q", sbrparams.SelfFencedMetricName, baseline.witnessAgents[witness])
-		Expect(selfFenced).To(Equal(baseline.witnessFenced[witness]),
-			"Witness agent on node %q must not self-fence: %s went from %v to %v",
-			witness, sbrparams.SelfFencedMetricName, baseline.witnessFenced[witness], selfFenced)
-	}
-}

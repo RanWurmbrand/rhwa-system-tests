@@ -667,7 +667,6 @@ func getSBRCRCondition(sbrObj *unstructured.Unstructured, condType string) map[s
 // the given StorageBasedRemediation CR.
 func fencingSucceededTransitionTime(sbrCR *unstructured.Unstructured) (time.Time, error) {
 	nodeName := sbrCR.GetName()
-
 	cond := getSBRCRCondition(sbrCR, sbrparams.FencingSucceededCondition)
 	if cond == nil {
 		return time.Time{}, fmt.Errorf("StorageBasedRemediation/%s has no %s condition yet",
