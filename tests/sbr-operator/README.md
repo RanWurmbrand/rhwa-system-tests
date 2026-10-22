@@ -519,3 +519,20 @@ Full test case: [docs/TESTCASES/rhwa-1964.md](../../docs/TESTCASES/rhwa-1964.md)
 - **Pass criteria**: Valid node map with ID 1 unused, full slot 1 zero through every
   agent for one minute, unchanged Ready pods and restart counts. Test SBRC and
   operands removed
+
+### 21. Verify Detect-Only Agents Stay Ready While Watchdog Is Held Open ([RHWA-1933](https://issues.redhat.com/browse/RHWA-1933))
+
+Validates the RHWA-1184 regression fix: with `detectOnlyMode: Enabled`, SBR agent pods start and
+remain Ready while a privileged keepalive pod holds `/dev/watchdog` open on every schedulable
+worker. The observation also checks agent pod identities and restart counts, keepalive processes,
+and that no worker reports `SBRStorageUnhealthy=True`. It runs unconditionally; no
+`SBR_TEST_RHWA1068` environment variable is required.
+
+Full test case: [docs/TESTCASES/rhwa-1933.md](../../docs/TESTCASES/rhwa-1933.md)
+
+- **Operators**: SBR v5.8.0, with the RHWA-1184 fix
+- **Cluster**: Multi-node, at least two schedulable workers
+- **Storage**: RWX StorageClass (CephFS auto-discovered or set with `SBR_STORAGE_CLASS`); skips when absent
+- **Environment**: Connected or disconnected. Non-destructive
+- **Standalone**: `ginkgo -v --label-filter="operator:sbr && tier:acceptance" --focus="RHWA-1184 regression" ./tests/sbr-operator/...`
+- **Pass criteria**: All agent pods stay Ready with the same UIDs and restart counts for 90 seconds; every keepalive remains running; no worker reports `SBRStorageUnhealthy=True`
