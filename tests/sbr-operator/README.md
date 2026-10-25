@@ -388,3 +388,156 @@ Full test case: [docs/TESTCASES/rhwa-1926.md](../../docs/TESTCASES/rhwa-1926.md)
   newest on the device; no fence slot with a reason other than `NONE`; a reader on a second node
   sees the identical node map and sequence numbers no lower; the decoded state is attached to the
   report
+
+### 17. Verify Node Hang Remediation on Ceph RBD Block Storage ([RHWA-1931](https://issues.redhat.com/browse/RHWA-1931))
+
+Exercises the full NHC-driven remediation path end to end in Block mode. A privileged injector pod
+triggers a SysRq kernel panic on a victim worker; its peers notice the heartbeat slot stop and set
+`SBRStorageUnhealthy=True` (reason `HeartbeatTimeout`); NHC creates a `StorageBasedRemediation` CR;
+a peer agent fences the node; and the reconciler proves death from storage, applies the
+`node.kubernetes.io/out-of-service` taint, and sets `FencingSucceeded=True` / `Succeeded=True`. Once
+the node reboots and rejoins and NHC deletes the CR, the node is uncordoned and the taint is removed.
+
+The block-mode counterpart of the Filesystem node hang test (`node_hang.go`, OCP-88738), with its
+own ID. The CR is looked up by node name on every poll because it can be deleted and recreated
+when `SBRStorageUnhealthy` cycles to `Unknown`; `FencingInProgress` is deliberately not asserted
+because the 60s fencing window and 60s staleness threshold make it flap.
+
+Full test case: [docs/TESTCASES/rhwa-1931.md](../../docs/TESTCASES/rhwa-1931.md)
+
+- **Operators**: SBR v5.8.0, NHC (skips when the NodeHealthCheck CRD is absent)
+- **Cluster**: Multi-node, at least 2 schedulable workers, one hosting no SBR controller pod
+- **Storage**: ODF Ceph RBD StorageClass, RWX, `volumeMode: Block`. Auto-discovered by
+  provisioner (`rbd.csi.ceph.com`); `SBR_RBD_STORAGE_CLASS` overrides it. Skips when the
+  cluster has none
+- **Environment**: Connected or disconnected; `SBR_INJECTOR_IMAGE` must be mirrored when
+  disconnected. **Destructive** — one worker is kernel-panicked and rebooted. Self Node
+  Remediation must not be running. Skips when another `NodeHealthCheck` already remediates through
+  the SBR template
+- **Standalone**: `ginkgo --label-filter="sbr" --focus="kernel panic on a Ceph RBD block-mode node" ./tests/sbr-operator/...`
+- **Pass criteria**: `SBRStorageUnhealthy=True` (reason `HeartbeatTimeout`) after the panic; NHC
+  creates exactly one `StorageBasedRemediation` CR for the victim; it reaches `FencingSucceeded=True`
+  and `Succeeded=True`; the node carries the `node.kubernetes.io/out-of-service` taint, then returns
+  Ready with a changed boot-id and a Ready agent pod; the boot-id holds steady for 90s; NHC deletes
+  the CR and the node becomes schedulable with the taint gone
+
+### 18. Verify Split-Brain Prevention on Ceph RBD Block Storage ([RHWA-1934](https://issues.redhat.com/browse/RHWA-1934))
+
+Proves that Block-mode fencing hits only the storage-isolated node. A privileged injector pod blocks
+outbound Ceph traffic (ports 3300, 6789, 6800–7300) on one victim worker while its peers keep their
+device access. A peer sets `SBRStorageUnhealthy=True` (reason `HeartbeatTimeout`) on the victim; NHC
+creates a `StorageBasedRemediation` CR; a peer agent fences it; and the reconciler proves death from
+storage, applies the `node.kubernetes.io/out-of-service` taint, and sets `FencingSucceeded=True` /
+`Succeeded=True`. The victim reboots, rejoins, and is uncordoned with the taint removed once NHC
+deletes the CR.
+
+Everything else is a witness assertion: for 60s no witness is flagged unhealthy or gets a CR, and
+after the fence every witness stays Ready, schedulable, on its original boot-id, with the same agent
+pod, restart count and `sbr_self_fenced_total`. The victim's heartbeat node ID is looked up in the
+on-device node map through an observer agent on a witness, its slot is read at index nodeID-1, and the
+`FencingSucceeded` transition is asserted to be later than the victim's last recorded heartbeat —
+death cannot be proven before the node went silent.
+
+The block-mode counterpart of the Filesystem split-brain test (`split_brain.go`, OCP-88877), with its
+own ID. The CR is looked up by node name on every poll because it can be recreated when
+`SBRStorageUnhealthy` cycles to `Unknown`; `FencingInProgress` is deliberately not asserted because
+the 60s fencing window and 60s staleness threshold make it flap.
+
+Full test case: [docs/TESTCASES/rhwa-1934.md](../../docs/TESTCASES/rhwa-1934.md)
+
+- **Operators**: SBR v5.8.0, NHC (skips when the NodeHealthCheck CRD is absent)
+- **Cluster**: Multi-node, at least 3 schedulable workers not hosting an SBR controller pod (one
+  victim and at least two witnesses); skips otherwise
+- **Storage**: ODF Ceph RBD StorageClass, RWX, `volumeMode: Block`. Auto-discovered by
+  provisioner (`rbd.csi.ceph.com`); `SBR_RBD_STORAGE_CLASS` overrides it. Skips when the
+  cluster has none
+- **Environment**: Connected or disconnected; `SBR_INJECTOR_IMAGE` must be mirrored when
+  disconnected. **Destructive** — one worker is cut off from Ceph, fenced and rebooted. Self Node
+  Remediation must not be running. Skips when another `NodeHealthCheck` already remediates through
+  the SBR template
+- **Standalone**: `ginkgo --label-filter="sbr" --focus="only the storage-isolated Ceph RBD node is fenced" ./tests/sbr-operator/...`
+- **Pass criteria**: victim reaches `SBRStorageUnhealthy=True` (reason `HeartbeatTimeout`); for 60s no
+  witness is flagged unhealthy or gets a CR; NHC creates exactly one `StorageBasedRemediation` CR for
+  the victim; it reaches `FencingSucceeded=True` / `Succeeded=True` with the transition later than the
+  victim's last heartbeat, and the victim carries the `out-of-service` taint; every witness stays
+  Ready, schedulable, same boot-id, unchanged `sbr_self_fenced_total`; the victim returns Ready with a
+  changed boot-id and a Ready agent pod, holds steady for 90s, then NHC deletes the CR and the node
+  becomes schedulable with the taint gone
+
+### 19. Verify Total Storage I/O Loss Reboots a Ceph RBD Block-Mode Node via the Watchdog ([RHWA-1944](https://issues.redhat.com/browse/RHWA-1944))
+
+Proves the watchdog path in Block mode: a privileged injector pod blocks Ceph traffic on one victim
+worker in **both** directions (ports 3300, 6789, 6800–7300 on the OUTPUT and INPUT chains), with no
+time limit, so the victim can neither write its heartbeat nor read the fence message peers write into
+its own fence slot. The only mechanism left to reboot it is its watchdog — its agent sees a
+`StorageBasedRemediation` CR for its own node and stops petting.
+
+A peer sets `SBRStorageUnhealthy=True` (reason `HeartbeatTimeout`); NHC creates the CR; the
+reconciler proves death from storage, applies the `node.kubernetes.io/out-of-service` taint and sets
+`FencingSucceeded=True` / `Succeeded=True`; the victim's boot-id changes, it returns Ready with a
+Ready agent pod, holds that boot-id for 90s, and is uncordoned with the taint removed once NHC
+deletes the CR.
+
+The block-mode counterpart of the Filesystem total storage I/O loss test (`storage_loss_watchdog.go`,
+OCP-88880), with its own ID. The fencing proof is awaited **before** the reboot: death is proven from
+the already-stale heartbeat slot long before kubelet reports a new boot-id, and once the victim is
+back its iptables rules are gone with the reboot, so NHC deletes the CR and the taint goes with it.
+The CR is looked up by node name on every poll because it can be recreated when `SBRStorageUnhealthy`
+cycles to `Unknown`; `FencingInProgress` is deliberately not asserted because the 60s fencing window
+and 60s staleness threshold make it flap.
+
+Full test case: [docs/TESTCASES/rhwa-1944.md](../../docs/TESTCASES/rhwa-1944.md)
+
+- **Operators**: SBR v5.8.0, NHC (skips when the NodeHealthCheck CRD is absent)
+- **Cluster**: Multi-node, at least one schedulable worker not hosting an SBR controller pod; skips
+  otherwise
+- **Storage**: ODF Ceph RBD StorageClass, RWX, `volumeMode: Block`. Auto-discovered by
+  provisioner (`rbd.csi.ceph.com`); `SBR_RBD_STORAGE_CLASS` overrides it. Skips when the
+  cluster has none
+- **Environment**: Connected or disconnected; `SBR_INJECTOR_IMAGE` must be mirrored when
+  disconnected. **Destructive** — one worker loses Ceph entirely and is rebooted by its watchdog.
+  Self Node Remediation must not be running. Skips when another `NodeHealthCheck` already remediates
+  through the SBR template, or when iptables is unusable in the victim's host namespaces
+- **Standalone**: `ginkgo --label-filter="sbr" --focus="the isolated Ceph RBD node is rebooted by its watchdog" ./tests/sbr-operator/...`
+- **Pass criteria**: victim reaches `SBRStorageUnhealthy=True` (reason `HeartbeatTimeout`); NHC
+  creates a `StorageBasedRemediation` CR for it; the CR reaches `FencingSucceeded=True` /
+  `Succeeded=True` and the victim carries the `out-of-service` taint; the victim's boot-id changes
+  (the watchdog rebooted it), it returns Ready with a Ready agent pod and holds that boot-id for 90s;
+  NHC deletes the CR and the node becomes schedulable with the taint gone
+
+### 20. Verify StorageBasedRemediationConfig Lifecycle in Block Mode on Ceph RBD ([RHWA-1960](https://issues.redhat.com/browse/RHWA-1960))
+
+Creates, patches, replaces and deletes an SBRC with `sharedStorageVolumeMode: Block` on Ceph RBD,
+asserting the steps the operator takes only in Block mode. A Block-mode config with no
+`sharedStorageClass` never gets agents — refused at admission when a validating webhook is
+registered, otherwise admitted and refused at reconcile with a `ValidationError` Warning. The
+shared-storage PVC is `ReadWriteMany` with `volumeMode: Block`; the device-init Job succeeds and the
+agent DaemonSet is created only after it; the agent attaches the device through `volumeDevices` at
+`/sbr-block` with no `volumeMounts` for it, runs with `--sbr-device=/sbr-block` and
+`--sbr-file-locking=false`, and reaches the watchdog through `/host-dev` instead of a mounted host
+`/dev`. `sharedStorageVolumeMode` cannot be patched afterwards; a `sbrTimeoutSeconds` patch rolls
+every agent onto the new revision. Deleting the SBRC removes its DaemonSet and PVC and runs **no**
+node map cleanup Job — Block mode keeps its node map inside the device, so the Filesystem-only
+cleanup has nothing to wipe. A second SBRC then gets a fresh PVC and a fresh init Job.
+
+The Block-mode counterpart of the Filesystem SBRC lifecycle test (`sbrc_lifecycle.go`, OCP-88734),
+with its own ID. The two SBRCs never run at the same time: every agent holds `/dev/watchdog`, so a
+second DaemonSet on the same nodes would crash-loop on EBUSY.
+
+Full test case: [docs/TESTCASES/rhwa-1960.md](../../docs/TESTCASES/rhwa-1960.md)
+
+- **Operators**: SBR v5.8.0 (skips below it — the CRD predates `sharedStorageVolumeMode`)
+- **Cluster**: Multi-node; at least two schedulable workers so the rollout assertion covers more
+  than one agent
+- **Storage**: ODF Ceph RBD StorageClass, RWX, `volumeMode: Block`. Auto-discovered by provisioner
+  (`rbd.csi.ceph.com`); `SBR_RBD_STORAGE_CLASS` overrides it. Skips when the cluster has none
+- **Environment**: Connected or disconnected. **Non-destructive** — no node is cordoned, rebooted or
+  partitioned. Self Node Remediation must not be running
+- **Standalone**: `ginkgo --label-filter="sbr" --focus="Block-mode SBRC lifecycle on Ceph RBD" ./tests/sbr-operator/...`
+- **Pass criteria**: the storage-class-less SBRC never gets a DaemonSet; A's PVC is RWX
+  `volumeMode: Block`; the init Job succeeds before the DaemonSet is created; the agent uses
+  `volumeDevices` at `/sbr-block`, the Block args, and the `/host-dev` watchdog mount;
+  `sharedStorageVolumeMode` is rejected on patch (where a webhook exists) and the stored value stays
+  `Block`; the `sbrTimeoutSeconds` patch puts every pod on the new revision Ready with none
+  unavailable; deleting A runs no `sbr-cleanup` Job and removes its DaemonSet and PVC; B gets a new
+  PVC and its own init Job, becomes ready, and deletes cleanly
