@@ -44,6 +44,13 @@ func getNodeBootID(nodeName string) (string, error) {
 	return bootID, nil
 }
 
+// nsenterCmd is the nsenter binary name used to enter host namespaces.
+// nsenterMountFlag is the --mount flag passed to nsenter to enter the host mount namespace.
+const (
+	nsenterCmd       = "nsenter"
+	nsenterMountFlag = "--mount"
+)
+
 // cephFSRejectBidirectional defines nsenter + iptables REJECT rules for both INPUT and OUTPUT
 // chains covering all CephFS port groups: 3300 (msgr2), 6789 (msgr1 mon), 6800-7300 (OSD/MDS).
 var cephFSRejectBidirectional = [][]string{
@@ -1186,7 +1193,7 @@ func verifyCephFSIPTablesClean(injectorPod *pod.Builder) {
 
 	for attempt := 1; attempt <= maxRemovalAttempts; attempt++ {
 		outputRules, outputErr := injectorPod.ExecCommand([]string{
-			"nsenter", "--target", "1", "--net", "--mount", "--",
+			nsenterCmd, "--target", "1", "--net", nsenterMountFlag, "--",
 			"iptables", "-S", "OUTPUT",
 		})
 		if outputErr != nil {
@@ -1196,7 +1203,7 @@ func verifyCephFSIPTablesClean(injectorPod *pod.Builder) {
 		}
 
 		inputRules, inputErr := injectorPod.ExecCommand([]string{
-			"nsenter", "--target", "1", "--net", "--mount", "--",
+			nsenterCmd, "--target", "1", "--net", nsenterMountFlag, "--",
 			"iptables", "-S", "INPUT",
 		})
 		if inputErr != nil {

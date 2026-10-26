@@ -53,6 +53,8 @@ var _ = Describe(
 		)
 
 		BeforeAll(func() {
+			By("Clearing residual Ceph OSD blocklist entries from prior tests")
+			clearCephOSDBlocklist()
 			requireNoSBRNodeHealthCheck()
 
 			// The minimum sbrTimeoutSeconds (10) halves to a 5s heartbeat interval, the tightest

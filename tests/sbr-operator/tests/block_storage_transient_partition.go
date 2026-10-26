@@ -47,6 +47,8 @@ var _ = Describe(
 		)
 
 		BeforeAll(func() {
+			By("Clearing residual Ceph OSD blocklist entries from prior tests")
+			clearCephOSDBlocklist()
 			Skip("Skipping until RHWA-1966 is resolved")
 			requireNoSBRNodeHealthCheck()
 			testSBRC = setupBlockModeSBRC(sbrparams.SBRCBlockTransientTestName)

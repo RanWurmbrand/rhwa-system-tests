@@ -37,6 +37,9 @@ var _ = Describe(
 		)
 
 		BeforeAll(func() {
+			By("Clearing residual Ceph OSD blocklist entries from prior tests")
+			clearCephOSDBlocklist()
+
 			By("Discovering Ceph RBD block storage class")
 
 			rbdStorageClass = discoverCephRBDStorageClass()
