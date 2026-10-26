@@ -63,7 +63,7 @@ var _ = Describe(
 		})
 
 		AfterAll(func() {
-			By("DeferCleanup: restoring original EndpointHealthCheckUrl on the default SNRC")
+			By("AfterAll: restoring original EndpointHealthCheckUrl on the default SNRC")
 			restoreEndpointHealthCheckURL(originalEndpointURL, originalEndpointURLFound)
 		})
 
@@ -95,7 +95,7 @@ var _ = Describe(
 
 				By("Verifying the NetworkPolicy's static ingress and egress rules")
 
-				verifyStaticNetworkPolicyRules(networkPolicy, hostPort)
+				verifyStaticNetworkPolicyRules(networkPolicy, hostPort, snrparams.NetworkPolicyStaticEgressRules)
 
 				By("Deleting the NetworkPolicy and verifying the operator recreates it")
 
@@ -117,6 +117,17 @@ var _ = Describe(
 				}, medik8sparams.DefaultTimeout, snrparams.DefaultPollInterval).Should(Succeed(),
 					"NetworkPolicy %q egress must include an ipBlock rule scoped to %s",
 					snrparams.NetworkPolicyName, snrparams.EndpointTestIPv4ACIDR)
+
+				By("Verifying the four static egress rules survive alongside the new ipBlock rule")
+
+				freshNetworkPolicy := &networkingv1.NetworkPolicy{}
+				Expect(APIClient.Get(context.TODO(),
+					client.ObjectKey{
+						Name:      snrparams.NetworkPolicyName,
+						Namespace: medik8sparams.OperatorNs,
+					}, freshNetworkPolicy)).To(Succeed(),
+					"Failed to re-fetch NetworkPolicy %q after setting EndpointHealthCheckUrl", snrparams.NetworkPolicyName)
+				verifyStaticNetworkPolicyRules(freshNetworkPolicy, hostPort, snrparams.NetworkPolicyStaticEgressRules+1)
 
 				By("Simulating a DNS flip and verifying the egress ipBlock rule updates to the new IP")
 
@@ -177,7 +188,12 @@ func egressPortSet(rule networkingv1.NetworkPolicyEgressRule) map[corev1.Protoco
 // NetworkPolicy's baseline (no EndpointHealthCheckUrl) shape: it selects only
 // agent pods, restricts both ingress and egress, allows peer traffic on
 // hostPort in both directions, and allows DNS/HTTPS/own-node-kubelet egress.
-func verifyStaticNetworkPolicyRules(networkPolicy *networkingv1.NetworkPolicy, hostPort int32) {
+func verifyStaticNetworkPolicyRules(
+	networkPolicy *networkingv1.NetworkPolicy, hostPort int32, expectedEgressRules int,
+) {
+	Expect(networkPolicy.Labels).To(HaveKeyWithValue(snrparams.NetworkPolicyLabelKey, snrparams.NetworkPolicyLabelValue),
+		"NetworkPolicy %q must carry the %s=%s label", networkPolicy.Name,
+		snrparams.NetworkPolicyLabelKey, snrparams.NetworkPolicyLabelValue)
 	Expect(networkPolicy.Spec.PodSelector.MatchLabels).To(Equal(snrparams.AgentPodSelectorMatchLabels),
 		"NetworkPolicy %q must select only the agent pods", networkPolicy.Name)
 	Expect(networkPolicy.Spec.PolicyTypes).To(ConsistOf(networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress),
@@ -198,8 +214,8 @@ func verifyStaticNetworkPolicyRules(networkPolicy *networkingv1.NetworkPolicy, h
 	Expect(ingressRule.Ports[0].Protocol).ToNot(BeNil())
 	Expect(*ingressRule.Ports[0].Protocol).To(Equal(corev1.ProtocolTCP),
 		"NetworkPolicy %q ingress protocol must be TCP", networkPolicy.Name)
-	Expect(networkPolicy.Spec.Egress).To(HaveLen(4),
-		"NetworkPolicy %q must have exactly 4 static egress rules: peer, DNS, HTTPS, kubelet", networkPolicy.Name)
+	Expect(networkPolicy.Spec.Egress).To(HaveLen(expectedEgressRules),
+		"NetworkPolicy %q must have exactly %d egress rules", networkPolicy.Name, expectedEgressRules)
 
 	var foundPeer, foundDNS, foundHTTPS, foundKubelet bool
 
@@ -265,7 +281,7 @@ func verifyNetworkPolicyRecreated(originalUID types.UID) error {
 // verifyEgressIPBlockCIDR fetches the live NetworkPolicy and checks that its
 // egress rules contain exactly one bare ipBlock rule (no ports, a single
 // peer), scoped to expectedCIDR. More than one such rule, a different CIDR,
-// or none at all is an error
+// or none at all is an error.
 func verifyEgressIPBlockCIDR(expectedCIDR string) error {
 	networkPolicy := &networkingv1.NetworkPolicy{}
 	if err := APIClient.Get(context.TODO(),

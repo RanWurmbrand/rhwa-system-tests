@@ -192,7 +192,18 @@ const (
 	// renders and reconciles for the SNR agent DaemonSet pods.
 	NetworkPolicyName = "self-node-remediation-ds-np"
 
-	// DefaultHostPort is the kubebuilder default for SelfNodeRemediationConfig
+	// NetworkPolicyLabelKey is the label key the operator stamps onto the
+	// rendered NetworkPolicy.
+	NetworkPolicyLabelKey = "k8s-app"
+	// NetworkPolicyLabelValue is the label value the operator stamps onto the
+	// rendered NetworkPolicy.
+	NetworkPolicyLabelValue = "self-node-remediation"
+
+	// NetworkPolicyStaticEgressRules is the number of static egress rules the
+	// NetworkPolicy always carries (peer, DNS, HTTPS, own-node kubelet).
+	NetworkPolicyStaticEgressRules = 4
+
+	// DefaultHostPort is the kubebuilder default for SelfNodeRemediationConfig.
 	DefaultHostPort = 30001
 
 	// NetworkPolicyDNSPort is the DNS port allowed in the NetworkPolicy's
