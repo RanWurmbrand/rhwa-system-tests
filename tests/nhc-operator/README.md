@@ -550,7 +550,7 @@ provides a remediation template CRD; this test uses SNR as the remediator.
 
 ### 27. NHC Must-Gather Collection During Active Remediation ([OCP-51086](https://polarion.engineering.redhat.com/polarion/#/project/OSE/workitem?id=OCP-51086))
 
-Selects a worker node that does not host an SNR controller pod, stops its
+Selects a worker node that hosts neither an SNR nor an NHC controller pod, stops its
 kubelet via SSH to trigger remediation, waits for the NHC CR to reach
 `Remediating` and the SNR CR to be created, then runs `oc adm must-gather` and
 validates the collected artifacts. Finally waits for the node to reboot and the
@@ -563,6 +563,7 @@ NHC CR to return to `Enabled`.
   `oc image info`, which warns (without failing) when the ref is unreachable
 - **Standalone**: `ginkgo --label-filter="nhc && disruption:destructive" --focus="collects NHC data via oc adm must-gather" ./tests/nhc-operator/...`
 - **Skipped when**: no SSH key is available, the SelfNodeRemediation CRD is absent, the
-  SNR controller deployment is not Ready, or fewer than 2 worker nodes are Ready. Each
-  skip records a `skipped-reason` report entry
-- **Pass criteria**: A worker node hosting neither an SNR nor an NHC controller pod is selected, stale worker-selecting NHC CRs are cleared, kubelet stop succeeds, the NHC CR reaches `Enabled` before the break and `Remediating` after it, an SNR CR exists for the target node, at least one NHC controller pod is found, the resolved must-gather image contains a tag separator, `oc adm must-gather` exits successfully, and the output contains the target node's YAML, the NHC controller deployment YAML in the operator namespace, the `nhc-test-must-gather` CR YAML, a SelfNodeRemediation CR collected during the active remediation, the NHC CRD definition and collected data for every NHC controller pod; the node then reboots (boot ID changes), the SNR CR is removed and the NHC CR returns to `Enabled`
+  SNR controller deployment is not Ready, fewer than 2 worker nodes are Ready, or no
+  worker node is free of SNR/NHC controller pods. Each skip records a `skipped-reason`
+  report entry
+- **Pass criteria**: A worker node hosting neither an SNR nor an NHC controller pod is selected, NHC CRs whose selector matches the target node are cleared, kubelet stop succeeds, the NHC CR reaches `Enabled` before the break and `Remediating` after it, an SNR CR exists for the target node, at least one NHC controller pod is found, the resolved must-gather image contains a tag separator, `oc adm must-gather` exits successfully, and the output contains the target node's YAML, the operator namespace's aggregated `deployments.yaml`, the `nhc-test-must-gather` CR YAML, a SelfNodeRemediation CR collected during the active remediation, the NHC CRD definition and collected data for every NHC controller pod; the node then reboots (boot ID changes), the SNR CR is removed and the NHC CR returns to `Enabled`

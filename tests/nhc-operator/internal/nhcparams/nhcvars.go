@@ -33,18 +33,6 @@ var (
 		"nodehealthchecks." + CRDGroup,
 	}
 
-	// WorkerSelectingNHCNames lists every NHC CR name in this suite whose
-	// selector targets worker nodes. NHC remediates only one CR at a time, so a
-	// spec that needs its own CR to reach Remediating must first clear any of
-	// these left behind by an interrupted sibling spec.
-	WorkerSelectingNHCNames = []string{
-		NHCMustGatherTestName,
-		NHCOldDefaultName,
-		NHCTestName,
-		NHCSecondTestName,
-		NHCStatusTestName,
-	}
-
 	// ReporterNamespacesToDump tells the reporter from where to collect logs.
 	ReporterNamespacesToDump = map[string]string{
 		medik8sparams.OperatorNs: medik8sparams.OperatorNs,

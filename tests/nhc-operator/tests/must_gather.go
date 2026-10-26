@@ -20,6 +20,7 @@ import (
 	"github.com/medik8s/system-tests/tests/internal/mustgather"
 	"github.com/medik8s/system-tests/tests/nhc-operator/internal/nhcparams"
 
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -50,9 +51,32 @@ var _ = Describe("NHC Must-Gather Collection",
 			// buildNHCForWorkers points at SNRTemplateName; if SNR is installed but
 			// not running, NHC goes Disabled and the failure would surface as an
 			// opaque "did not reach Enabled" timeout with no mention of SNR.
+			// deployment.Pull flattens a missing deployment into a plain
+			// error, which k8serrors.IsNotFound cannot distinguish from a
+			// transient API failure. The raw Get returns the real status
+			// error, so IsNotFound classifies it correctly.
+			if _, getErr := APIClient.Deployments(medik8sparams.OperatorNs).Get(
+				ctx, nhcparams.SNRDeploymentName, metav1.GetOptions{}); getErr != nil {
+				// A missing deployment means SNR is not deployed -- skip. Any
+				// other API error (timeout, connection reset) fails the spec:
+				// silently skipping a destructive acceptance run on a transient
+				// error makes a green suite no evidence this spec executed.
+				if !k8serrors.IsNotFound(getErr) {
+					Expect(getErr).ToNot(HaveOccurred(),
+						"Failed to get SNR deployment %q", nhcparams.SNRDeploymentName)
+				}
+
+				skipWithReason(fmt.Sprintf(
+					"SNR deployment %q not found -- NHC must-gather test requires a working remediator",
+					nhcparams.SNRDeploymentName))
+			}
+
 			snrDeployment, snrErr := deployment.Pull(
 				APIClient, nhcparams.SNRDeploymentName, medik8sparams.OperatorNs)
-			if snrErr != nil || !snrDeployment.IsReady(medik8sparams.DefaultTimeout) {
+			Expect(snrErr).ToNot(HaveOccurred(),
+				"Failed to pull SNR deployment %q", nhcparams.SNRDeploymentName)
+
+			if !snrDeployment.IsReady(medik8sparams.DefaultTimeout) {
 				skipWithReason(fmt.Sprintf(
 					"SNR deployment %q is not Ready -- NHC must-gather test requires a working remediator",
 					nhcparams.SNRDeploymentName))
@@ -102,7 +126,13 @@ var _ = Describe("NHC Must-Gather Collection",
 							"cannot safely exclude the remediator's host")
 					GinkgoWriter.Printf("Excluding controller nodes: %v\n", excludedNodes)
 					targetNode, err := helpers.SelectWorkerNode(ctx, APIClient, excludedNodes...)
-					Expect(err).ToNot(HaveOccurred(), "Failed to select a worker node to remediate")
+					if err != nil {
+						// A 2-worker cluster can have controller pods on both
+						// workers; that is an unsupported layout, not a product
+						// failure, so it skips rather than fails.
+						skipWithReason(fmt.Sprintf(
+							"No eligible worker node free of SNR/NHC controller pods: %v", err))
+					}
 					targetName := targetNode.Name
 					GinkgoWriter.Printf("Target node for must-gather test: %s\n", targetName)
 
@@ -113,10 +143,15 @@ var _ = Describe("NHC Must-Gather Collection",
 
 					By("Pre-cleaning stale NHC and SNR CRs")
 
-					// Any leftover worker-selecting NHC CR from a sibling spec would win
-					// the "only one NHC remediates at a time" race and this spec's CR
+					// Any leftover NHC CR selecting this node would win the
+					// "only one NHC remediates at a time" race and this spec's CR
 					// would never reach Remediating.
-					for _, staleName := range nhcparams.WorkerSelectingNHCNames {
+					staleNHCs, err := listNHCsSelectingNode(ctx, targetNode.Labels)
+					Expect(err).ToNot(HaveOccurred(),
+						"Failed to list NHC CRs selecting node %s", targetName)
+					GinkgoWriter.Printf("Pre-cleaning NHC CRs selecting %s: %v\n",
+						targetName, staleNHCs)
+					for _, staleName := range staleNHCs {
 						cleanupNHCCR(ctx, staleName)
 						waitForNHCGone(ctx, staleName)
 					}
@@ -134,8 +169,12 @@ var _ = Describe("NHC Must-Gather Collection",
 					// Registered before the kubelet is stopped so recovery still runs if
 					// the spec fails between the stop and the gather.
 					DeferCleanup(func() {
-						By("Cleaning up NHC and SNR CRs for " + targetName)
-						cleanupNHCCR(ctx, nhcName)
+						// The SNR CR is deleted first and the NHC CR last:
+						// while an SNR CR exists the NHC webhook denies NHC
+						// deletion, so the reverse order burns the 5-minute
+						// deletion poll while the node is still broken and can
+						// leak the NHC CR entirely.
+						By("Cleaning up the SNR CR for " + targetName)
 						cleanupSNRCR(ctx, targetName)
 
 						By("Restarting kubelet on " + targetName)
@@ -158,6 +197,12 @@ var _ = Describe("NHC Must-Gather Collection",
 							AddReportEntry("safety-net-recovery-failed",
 								fmt.Sprintf("node %s did not recover: %v", targetName, recoverErr))
 						}
+
+						By("Cleaning up NHC CR " + nhcName + " after recovery")
+
+						// With the node Ready no remediation is running, so the
+						// webhook cannot block this deletion.
+						cleanupNHCCR(ctx, nhcName)
 					})
 
 					By("Creating NHC CR " + nhcName + " for workers")

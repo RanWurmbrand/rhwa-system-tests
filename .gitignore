@@ -41,6 +41,3 @@ coverage.html
 kubeconfig
 *.kubeconfig
 _output/
-
-# Local agent tooling scratch directory
-.claude-flow/
