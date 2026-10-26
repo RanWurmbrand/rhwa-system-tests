@@ -58,6 +58,98 @@ func deleteKeepalivePods(podNames []string) {
 	}
 }
 
+const watchdogOpenedMarker = "WATCHDOG_OPENED"
+
+// keepalivePodOpenedWatchdog returns nil only after the keepalive container confirms it opened the host watchdog.
+func keepalivePodOpenedWatchdog(podName string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), sbrparams.SBRCReadyDiagTimeout)
+	defer cancel()
+
+	keepalivePod, getErr := APIClient.CoreV1Interface.Pods(medik8sparams.OperatorNs).Get(
+		ctx, podName, metav1.GetOptions{})
+	if getErr != nil {
+		return fmt.Errorf("get watchdog keepalive pod %s: %w", podName, getErr)
+	}
+	if keepalivePod.Status.Phase != corev1.PodRunning {
+		return fmt.Errorf("watchdog keepalive pod %s is %s, want Running", podName, keepalivePod.Status.Phase)
+	}
+	if len(keepalivePod.Status.ContainerStatuses) == 0 {
+		return fmt.Errorf("watchdog keepalive pod %s has no container status", podName)
+	}
+
+	containerStatus := keepalivePod.Status.ContainerStatuses[0]
+	if containerStatus.State.Running == nil {
+		return fmt.Errorf("watchdog keepalive pod %s container %s is not running: %s",
+			podName, containerStatus.Name, strings.TrimSpace(containerStateSummary(containerStatus)))
+	}
+	if containerStatus.RestartCount != 0 {
+		return fmt.Errorf("watchdog keepalive pod %s container %s restarted %d time(s) before acquiring the watchdog",
+			podName, containerStatus.Name, containerStatus.RestartCount)
+	}
+
+	logs, logsErr := APIClient.CoreV1Interface.Pods(medik8sparams.OperatorNs).GetLogs(
+		podName, &corev1.PodLogOptions{Container: containerStatus.Name}).DoRaw(ctx)
+	if logsErr != nil {
+		return fmt.Errorf("read watchdog keepalive pod %s logs: %w", podName, logsErr)
+	}
+	if !strings.Contains(string(logs), watchdogOpenedMarker) {
+		return fmt.Errorf("watchdog keepalive pod %s has not logged %q", podName, watchdogOpenedMarker)
+	}
+
+	return nil
+}
+
+// watchdogKeepaliveDiagnostics reports pod/container state and current and previous container logs.
+func watchdogKeepaliveDiagnostics(podName string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), sbrparams.SBRCReadyDiagTimeout)
+	defer cancel()
+
+	keepalivePod, getErr := APIClient.CoreV1Interface.Pods(medik8sparams.OperatorNs).Get(
+		ctx, podName, metav1.GetOptions{})
+	if getErr != nil {
+		return fmt.Sprintf("Watchdog keepalive pod %s: GET failed: %v\n", podName, getErr)
+	}
+
+	var report strings.Builder
+	fmt.Fprintf(&report, "Watchdog keepalive pod %s: phase=%s reason=%q message=%q node=%q\n",
+		podName, keepalivePod.Status.Phase, keepalivePod.Status.Reason,
+		keepalivePod.Status.Message, keepalivePod.Spec.NodeName)
+
+	for _, containerStatus := range keepalivePod.Status.ContainerStatuses {
+		report.WriteString("  " + containerStateSummary(containerStatus))
+		if terminated := containerStatus.LastTerminationState.Terminated; terminated != nil {
+			fmt.Fprintf(&report, "  last termination: reason=%q exit=%d message=%q\n",
+				terminated.Reason, terminated.ExitCode, terminated.Message)
+		}
+
+		for _, previous := range []bool{false, true} {
+			logLabel := "current"
+			if previous {
+				logLabel = "previous"
+			}
+
+			logs, logsErr := APIClient.CoreV1Interface.Pods(medik8sparams.OperatorNs).GetLogs(
+				podName, &corev1.PodLogOptions{Container: containerStatus.Name, Previous: previous}).DoRaw(ctx)
+			if logsErr != nil {
+				fmt.Fprintf(&report, "  %s container logs: <unavailable: %v>\n", logLabel, logsErr)
+
+				continue
+			}
+
+			logText := strings.TrimSpace(string(logs))
+			if len(logText) > 8192 {
+				logText = logText[len(logText)-8192:]
+			}
+			if logText == "" {
+				logText = "<empty>"
+			}
+			fmt.Fprintf(&report, "  %s container logs (stdout/stderr):\n%s\n", logLabel, logText)
+		}
+	}
+
+	return report.String()
+}
+
 // detectOnlyAgentPodsRunning returns nil once the agent DaemonSet has rolled out its current
 // pod template and every desired pod has a running container. It checks Running instead of
 // Ready because the agent probes fail on healthy agents (RHWA-1759, RHWA-1057). Switch to
@@ -309,22 +401,34 @@ var _ = Describe(
 			podName := keepalivePodName(targetNodeName)
 			keepalivePods = []string{podName}
 			keepalivePod, createErr := pod.NewBuilder(
-				APIClient, podName, medik8sparams.OperatorNs, sbrparams.WatchdogDebugImage).
+				APIClient, podName, medik8sparams.OperatorNs, sbrparams.InjectorImage).
 				DefineOnNode(targetNodeName).
 				WithHostPid(true).
 				WithPrivilegedFlag().
 				RedefineDefaultCMD([]string{
-					"/bin/bash", "-c",
+					"sh", "-c",
 					"exec nsenter --target 1 --mount -- sh -c " +
 						"\"[ -c /dev/watchdog ] || exit 1; exec 200>/dev/watchdog || exit 1; " +
 						"trap 'printf V >&200 || true' EXIT; " +
 						"trap 'exit 0' TERM INT HUP; " +
+						"echo " + watchdogOpenedMarker + "; " +
 						"while true; do printf . >&200 || exit 1; sleep 3; done\"",
 				}).
 				CreateAndWaitUntilRunning(sbrparams.WatchdogKeepaliveTimeout)
 			Expect(createErr).ToNot(HaveOccurred(),
-				"Watchdog keepalive pod %s on worker %s must start", podName, targetNodeName)
-			GinkgoWriter.Printf("Keepalive pod %s Running on node %s\n",
+				func() string {
+					return fmt.Sprintf("Watchdog keepalive pod %s on worker %s must start\n%s",
+						podName, targetNodeName, watchdogKeepaliveDiagnostics(podName))
+				})
+
+			Eventually(func() error {
+				return keepalivePodOpenedWatchdog(podName)
+			}, sbrparams.WatchdogKeepaliveTimeout, sbrparams.DefaultPollInterval).Should(Succeed(),
+				func() string {
+					return fmt.Sprintf("Watchdog keepalive pod %s must open and hold /dev/watchdog\n%s",
+						podName, watchdogKeepaliveDiagnostics(podName))
+				})
+			GinkgoWriter.Printf("Keepalive pod %s confirmed /dev/watchdog open on node %s\n",
 				keepalivePod.Definition.Name, targetNodeName)
 
 			By("Creating StorageBasedRemediationConfig with detectOnlyMode: Enabled")
@@ -561,9 +665,9 @@ var _ = Describe(
 							return fmt.Errorf("watchdog keepalive pod %s is not Running", podName)
 						}
 						for _, cs := range keepalivePod.Status.ContainerStatuses {
-							if cs.State.Running == nil {
-								return fmt.Errorf("watchdog keepalive pod %s container %s is not running",
-									podName, cs.Name)
+							if cs.State.Running == nil || cs.RestartCount != 0 {
+								return fmt.Errorf("watchdog keepalive pod %s container %s is not continuously running (restarts=%d): %s",
+									podName, cs.Name, cs.RestartCount, strings.TrimSpace(containerStateSummary(cs)))
 							}
 						}
 					}
@@ -576,7 +680,16 @@ var _ = Describe(
 
 					return nil
 				}, sbrparams.DetectOnlySuppressionCheckDuration, sbrparams.DetectOnlySuppressionCheckInterval).Should(Succeed(),
-					"No worker node may report SBRStorageUnhealthy=True while /dev/watchdog is held (RHWA-1184)")
+					func() string {
+						var diagnostics strings.Builder
+						for _, podName := range keepalivePods {
+							diagnostics.WriteString(watchdogKeepaliveDiagnostics(podName))
+						}
+
+						return fmt.Sprintf(
+							"No worker node may report SBRStorageUnhealthy=True while /dev/watchdog is held (RHWA-1184)\n%s",
+							diagnostics.String())
+					})
 			})
 
 		It("Verify SBRC detectOnlyMode field: spec reflection, storage-fault suppression, toggle, and DaemonSet GC",

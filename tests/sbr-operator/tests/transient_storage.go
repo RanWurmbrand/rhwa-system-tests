@@ -59,8 +59,6 @@ func findTransientRWXStorageClass() string {
 
 // transientNodeHasCondition returns nil when the node's SBRStorageUnhealthy condition matches
 // wantTrue; error otherwise. A missing condition is treated as False.
-//
-//nolint:unparam // condType is kept explicit so callers read at the call site which condition they assert.
 func transientNodeHasCondition(nodeName string, wantTrue bool) error {
 	node, err := APIClient.CoreV1Interface.Nodes().Get(context.TODO(), nodeName, metav1.GetOptions{})
 	if err != nil {
