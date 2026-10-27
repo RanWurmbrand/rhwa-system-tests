@@ -46,6 +46,8 @@ and destructive remediation (kubelet stop, node reboot via NHC detection).
 - For destructive worker tests (15-17): NHC operator installed, 2+ worker nodes
 - For destructive master tests (18-19): NHC operator installed, 1+ worker nodes,
   3+ master nodes for etcd quorum safety
+- For the minPeersForRemediation test (20): 2+ Ready worker nodes; no NHC, SSH
+  or kubelet-stop command needed
 
 ## Running
 
@@ -242,6 +244,8 @@ and the Disabled condition disappears.
 Tests that stop kubelet on nodes, triggering NHC-based health detection
 and SNR remediation with node reboots. Require NHC operator installed,
 2+ worker nodes, and 3+ master nodes. Run time: ~5-10 minutes per test.
+Test 20 is the exception: it injects a network fault inside an agent pod
+rather than touching a node, needs no NHC, and expects no reboot.
 
 ### 15. Verify Worker Node Remediation After Kubelet Stop ([OCP-52416](https://polarion.engineering.redhat.com/polarion/#/project/OSE/workitem?id=OCP-52416))
 
@@ -303,3 +307,21 @@ concurrently -- both reboot and recover independently.
 - **Environment**: Connected or disconnected
 - **Standalone**: `ginkgo --label-filter="snr" --focus="simultaneously" ./tests/snr-operator/...`
 - **Pass criteria**: Both nodes rebooted (boot IDs changed), creation timestamps unchanged (not deleted/recreated), both recovered to Ready state
+
+### 20. Verify the SNR Agent Uses the Configured minPeersForRemediation ([RHWA-1972](https://redhat.atlassian.net/browse/RHWA-1972))
+
+Regression test for [RHWA-1872](https://redhat.atlassian.net/browse/RHWA-1872):
+the agent never read `MIN_PEERS_FOR_REMEDIATION` and used 0 regardless of
+`SelfNodeRemediationConfig.spec.minPeersForRemediation`. Sets the minimum to the
+Ready worker count -- one more than any single worker can observe -- then
+blackholes the api-server cluster IPs inside the agent pod's own network
+namespace for 2 minutes and checks the agent refuses to consult peers, naming
+the configured minimum. The node, its kubelet and every other pod keep full
+api-server access, and the routes are removed by the command that adds them.
+Test case: [docs/TESTCASES/rhwa-1972.md](../../docs/TESTCASES/rhwa-1972.md).
+
+- **Operators**: SNR 5.8.0+ (self-node-remediation PR #363)
+- **Cluster**: Multi-node with 2+ Ready workers (skips below that)
+- **Environment**: Connected or disconnected; no NHC, SSH or storage needed
+- **Standalone**: `ginkgo --label-filter="operator:snr && tier:resiliency" --focus="configured minPeersForRemediation value" ./tests/snr-operator/...`
+- **Pass criteria**: Agent pod carries `MIN_PEERS_FOR_REMEDIATION` equal to the configured value and logs `insufficient number of peers found` with `"minPeersRequired": <worker count>`; node boot ID unchanged and node still Ready; blackhole routes gone and the original `minPeersForRemediation` restored

@@ -63,6 +63,42 @@ const (
 	// when it auto-detects the softdog watchdog path after an invalid path is configured.
 	SoftdogAutoDetectMessage = "auto detected softdog path"
 
+	// MinPeersEnvVarName is the agent environment variable the controller
+	// renders from spec.minPeersForRemediation of the SNRC.
+	MinPeersEnvVarName = "MIN_PEERS_FOR_REMEDIATION"
+
+	// MinPeersInsufficientMessage is the substring the agent logs when it
+	// finds fewer worker peers than minPeersForRemediation requires and
+	// therefore treats the api-server error as healthy instead of asking
+	// peers for a SelfNodeRemediation CR.
+	MinPeersInsufficientMessage = "insufficient number of peers found"
+
+	// MinWorkersForPeerCheck is the minimum number of Ready worker nodes the
+	// minPeersForRemediation spec needs: the node under test plus at least
+	// one real peer, so that a build without the RHWA-1872 fix asks that peer
+	// and stays healthy instead of rebooting as an isolated node.
+	MinWorkersForPeerCheck = 2
+
+	// PeerListSettleTimeout is how long the agent pods must stay Running after
+	// a DaemonSet rollout before a fault is injected, so that every agent has
+	// refreshed its peer list (peerUpdateInterval defaults to 15s) and sees the
+	// peers that rolled after it.
+	PeerListSettleTimeout = 1 * time.Minute
+
+	// APIDisconnectDuration is how long the api-server addresses stay
+	// blackholed inside the agent pod. It must exceed
+	// maxApiErrorThreshold * apiCheckInterval (3 * 15s by default) so the
+	// agent reaches the peer-check path.
+	APIDisconnectDuration = 2 * time.Minute
+
+	// APIDisconnectExecTimeout bounds the blocking exec that injects and then
+	// removes the blackhole routes. It must exceed APIDisconnectDuration.
+	APIDisconnectExecTimeout = 5 * time.Minute
+
+	// AgentLogWindow is how far back agent pod logs are read when looking for
+	// a peer-check message.
+	AgentLogWindow = 15 * time.Minute
+
 	// SNRReasonConfigNotFound is the status condition reason when SNRC is missing.
 	SNRReasonConfigNotFound = "ConfigurationNotFound"
 
