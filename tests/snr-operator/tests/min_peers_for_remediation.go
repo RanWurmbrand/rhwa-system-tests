@@ -123,7 +123,7 @@ var _ = Describe("SNR Agent MinPeersForRemediation",
 					`{"spec":{"minPeersForRemediation":%d}}`, minPeersUnderTest))
 				Eventually(func() error {
 					return APIClient.Patch(context.TODO(),
-						snrcForPatch(snrparams.SNRConfigName),
+						snrcForPatch(),
 						client.RawPatch(types.MergePatchType, patch))
 				}, medik8sparams.DefaultTimeout, snrparams.DefaultPollInterval).Should(Succeed(),
 					"SNRC %q must accept minPeersForRemediation=%d",
@@ -150,7 +150,7 @@ var _ = Describe("SNR Agent MinPeersForRemediation",
 				By("Asserting the agent container on the node under test carries MIN_PEERS_FOR_REMEDIATION")
 
 				agentPodName := agentPodNameOnNode(targetWorkerName)
-				Expect(agentContainerEnv(agentPodName, snrparams.MinPeersEnvVarName)).
+				Expect(agentMinPeersEnv(agentPodName)).
 					To(Equal(strconv.FormatInt(minPeersUnderTest, 10)),
 						"Agent pod %q must carry %s=%d rendered from the SNRC",
 						agentPodName, snrparams.MinPeersEnvVarName, minPeersUnderTest)
@@ -240,7 +240,7 @@ func restoreSNRCMinPeers(value int64, found bool) {
 
 	Eventually(func() error {
 		return APIClient.Patch(context.TODO(),
-			snrcForPatch(snrparams.SNRConfigName),
+			snrcForPatch(),
 			client.RawPatch(types.MergePatchType, patch))
 	}, medik8sparams.DefaultTimeout, snrparams.DefaultPollInterval).Should(Succeed(),
 		"Failed to restore minPeersForRemediation on SNRC %q", snrparams.SNRConfigName)
@@ -281,9 +281,9 @@ func agentPodNameOnNode(nodeName string) string {
 	return podName
 }
 
-// agentContainerEnv returns the value of an environment variable on the manager
-// container of the named agent pod.
-func agentContainerEnv(podName, envName string) string {
+// agentMinPeersEnv returns the value of MIN_PEERS_FOR_REMEDIATION on the
+// manager container of the named agent pod.
+func agentMinPeersEnv(podName string) string {
 	agentPod, pullErr := pod.Pull(APIClient, podName, medik8sparams.OperatorNs)
 	Expect(pullErr).ToNot(HaveOccurred(), "Failed to pull agent pod %q", podName)
 
@@ -293,14 +293,14 @@ func agentContainerEnv(podName, envName string) string {
 		}
 
 		for _, env := range container.Env {
-			if env.Name == envName {
+			if env.Name == snrparams.MinPeersEnvVarName {
 				return env.Value
 			}
 		}
 	}
 
 	Fail(fmt.Sprintf("agent pod %q container %q has no %s environment variable",
-		podName, snrparams.ManagerContainerName, envName))
+		podName, snrparams.ManagerContainerName, snrparams.MinPeersEnvVarName))
 
 	return ""
 }
