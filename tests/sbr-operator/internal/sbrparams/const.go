@@ -586,10 +586,13 @@ const (
 	// AgentReadinessSuccessThreshold is the agent readiness probe's successThreshold.
 	AgentReadinessSuccessThreshold int32 = 1
 
+	// NetworkPolicyNamePrefix is the naming prefix the SBRC controller uses for the agent
+	// NetworkPolicy. It is identical to SBRAgentDaemonSetPrefix: both render as
+	// "sbr-agent-<sbrcName>".
 	NetworkPolicyNamePrefix = SBRAgentDaemonSetPrefix
 
 	// AgentAppLabelValue is the "app" label value stamped on agent pods and read back into the
-	// NetworkPolicy's podSelector/peer selectors
+	// NetworkPolicy's podSelector/peer selectors.
 	AgentAppLabelValue = "sbr-agent"
 
 	// RuntimeMetricsPort is the controller-runtime metrics port the agent NetworkPolicy allows
@@ -619,7 +622,7 @@ const (
 	// creates or updates the agent NetworkPolicy.
 	NetworkPolicyManagedEventReason = "NetworkPolicyManaged"
 
-	// SBRCNetworkPolicyTestName is the SBRC name used by the agent NetworkPolicy test
+	// SBRCNetworkPolicyTestName is the SBRC name used by the agent NetworkPolicy test.
 	SBRCNetworkPolicyTestName = "test-sbrc-network-policy"
 
 	// NetworkPolicyRecreateTimeout bounds the wait for the operator to recreate the agent

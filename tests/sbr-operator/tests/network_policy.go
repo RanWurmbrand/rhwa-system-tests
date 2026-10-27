@@ -102,7 +102,7 @@ func verifySBRNetworkPolicyIngressFrom(networkPolicy *networkingv1.NetworkPolicy
 	return nil
 }
 
-// verifySBRNetworkPolicyIngress asserts the full ingress shape
+// verifySBRNetworkPolicyIngress asserts the full ingress shape.
 func verifySBRNetworkPolicyIngress(networkPolicy *networkingv1.NetworkPolicy) {
 	Expect(networkPolicy.Spec.Ingress).To(HaveLen(1),
 		"NetworkPolicy %q must have exactly one ingress rule", networkPolicy.Name)
@@ -128,7 +128,7 @@ func verifySBRNetworkPolicyIngress(networkPolicy *networkingv1.NetworkPolicy) {
 
 // verifyMetricsNamespaceLabelWarning checks whether sbrparams.ExpectedOpenShiftMonitoringNamespace
 // carries the metrics label the agent NetworkPolicy's ingress rule requires. Every real OpenShift
-// cluster has this namespace
+// cluster has this namespace.
 func verifyMetricsNamespaceLabelWarning(sbrcName, sbrcUID string) {
 	monitoringNamespace := &corev1.Namespace{}
 	getErr := APIClient.Get(context.TODO(),
