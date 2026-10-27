@@ -500,3 +500,22 @@ Full test case: [docs/TESTCASES/rhwa-1965.md](../../docs/TESTCASES/rhwa-1965.md)
   with tuning `60/10/5/6/1`, and exactly `test -f /var/run/sbr-agent/preflight-ok` in detect-only
   mode; `hostPID` is still true; the DaemonSet schedules zero pods and is garbage-collected after
   the config is deleted
+
+
+### 20. Verify Startup Clears the Unused Preflight Slot ([RHWA-1964](https://redhat.atlassian.net/browse/RHWA-1964))
+
+Regression coverage for RHWA-1058. Creates a filesystem SBRC, verifies the shared
+node map assigns every real agent a unique ID other than 1, and reads slot 1
+through every agent for a minute. Skips if a real node owns ID 1.
+
+Full test case: [docs/TESTCASES/rhwa-1964.md](../../docs/TESTCASES/rhwa-1964.md)
+
+- **Operators**: SBR v5.8.0
+- **Cluster**: At least two Ready, schedulable workers. SNR agents must be stopped,
+  no unrelated SBRC may exist, and no NHC may reference an SBR template
+- **Storage**: RWX filesystem, CephFS auto-discovery or `SBR_STORAGE_CLASS`
+- **Environment**: Connected or disconnected. Non-destructive, no fault injection
+- **Standalone**: `ginkgo -v --label-filter='operator:sbr && tier:acceptance' --focus='startup clears the unassigned preflight slot' ./tests/sbr-operator`
+- **Pass criteria**: Valid node map with ID 1 unused, full slot 1 zero through every
+  agent for one minute, unchanged Ready pods and restart counts. Test SBRC and
+  operands removed

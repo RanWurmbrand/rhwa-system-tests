@@ -104,9 +104,10 @@ var snrcGVK = schema.GroupVersionKind{
 	Kind:    "SelfNodeRemediationConfig",
 }
 
-// snrcForPatch returns a minimal unstructured object for the default SNRC,
-// suitable for client.Patch calls. The CRD admits only one config, named
-// snrparams.SNRConfigName, so there is nothing to parameterise.
+// snrcForPatch returns a minimal unstructured object suitable for client.Patch
+// calls against the default SNRC. It takes no name: SNR's webhook rejects any
+// SelfNodeRemediationConfig not called snrparams.SNRConfigName, so there is
+// never another one to patch.
 func snrcForPatch() *unstructured.Unstructured {
 	obj := &unstructured.Unstructured{}
 	obj.SetGroupVersionKind(snrcGVK)

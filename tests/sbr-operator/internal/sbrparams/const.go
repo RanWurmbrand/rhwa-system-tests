@@ -8,6 +8,15 @@ import (
 )
 
 const (
+	// GhostPeerObservationDuration covers multiple five-second peer-monitor cycles.
+	GhostPeerObservationDuration = time.Minute
+
+	// GhostPeerReadTimeout bounds device execs and agent-state reads.
+	GhostPeerReadTimeout = 30 * time.Second
+
+	// GhostPeerCleanupTimeout bounds normal SBRC and operand removal.
+	GhostPeerCleanupTimeout = 6 * time.Minute
+
 	// DefaultPollInterval is the polling interval used with Eventually calls.
 	DefaultPollInterval = 5 * time.Second
 
