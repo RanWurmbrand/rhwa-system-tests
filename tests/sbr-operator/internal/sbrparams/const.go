@@ -586,6 +586,49 @@ const (
 
 	// AgentReadinessSuccessThreshold is the agent readiness probe's successThreshold.
 	AgentReadinessSuccessThreshold int32 = 1
+
+	// NetworkPolicyNamePrefix is the naming prefix the SBRC controller uses for the agent
+	// NetworkPolicy. It is identical to SBRAgentDaemonSetPrefix: both render as
+	// "sbr-agent-<sbrcName>".
+	NetworkPolicyNamePrefix = SBRAgentDaemonSetPrefix
+
+	// AgentAppLabelValue is the "app" label value stamped on agent pods and read back into the
+	// NetworkPolicy's podSelector/peer selectors.
+	AgentAppLabelValue = "sbr-agent"
+
+	// RuntimeMetricsPort is the controller-runtime metrics port the agent NetworkPolicy allows
+	// ingress to, alongside AgentMetricsPort.
+	RuntimeMetricsPort = int32(8080)
+
+	// MetricsNamespaceSelectorLabelKey is the label key that scopes the agent NetworkPolicy's
+	// ingress rule on the metrics ports to namespaces carrying this label (e.g.
+	// openshift-monitoring).
+	MetricsNamespaceSelectorLabelKey = "metrics"
+
+	// MetricsNamespaceSelectorLabelValue is the label value paired with
+	// MetricsNamespaceSelectorLabelKey.
+	MetricsNamespaceSelectorLabelValue = "enabled"
+
+	// ExpectedOpenShiftMonitoringNamespace is the namespace the operator checks for the
+	// MetricsNamespaceSelectorLabelKey/Value label before warning that Prometheus will be cut off
+	// from the agent metrics ports.
+	ExpectedOpenShiftMonitoringNamespace = "openshift-monitoring"
+
+	// MetricsNamespaceLabelMissingEventReason is the Warning event reason the operator emits on
+	// the StorageBasedRemediationConfig when ExpectedOpenShiftMonitoringNamespace lacks the
+	// metrics label.
+	MetricsNamespaceLabelMissingEventReason = "MetricsNamespaceLabelMissing"
+
+	// NetworkPolicyManagedEventReason is the Normal event reason the operator emits when it
+	// creates or updates the agent NetworkPolicy.
+	NetworkPolicyManagedEventReason = "NetworkPolicyManaged"
+
+	// SBRCNetworkPolicyTestName is the SBRC name used by the agent NetworkPolicy test.
+	SBRCNetworkPolicyTestName = "test-sbrc-network-policy"
+
+	// NetworkPolicyRecreateTimeout bounds the wait for the operator to recreate the agent
+	// NetworkPolicy after it is deleted out-of-band, and for a drifted spec to be restored.
+	NetworkPolicyRecreateTimeout = 2 * time.Minute
 )
 
 // AgentProbeForbiddenSubstrings are the fragments of a host process-table scan that must never
