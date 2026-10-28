@@ -300,7 +300,7 @@ The SBR test suite is organized in the `/tests/sbr-operator/tests/` directory wi
 - **Override**: Set `SBR_STORAGE_CLASS` env var
 - **Requirement**: ReadWriteMany (RWX) access mode
 
-#### Test ID: 1933 - Detect-Only Startup With Watchdog Held Open (`detect_only.go`)
+#### Test ID: 1933 - Detect-Only Startup With Watchdog Held Open (`detect_only.go`) 
 **Purpose**: Verify SBR agents remain Ready in detect-only mode while another process holds `/dev/watchdog` open
 **Description**:
 - Starts a privileged watchdog keepalive pod on every schedulable worker before creating the detect-only configuration
