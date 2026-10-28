@@ -53,6 +53,8 @@ var _ = Describe(
 		)
 
 		BeforeAll(func() {
+			By("Clearing residual Ceph OSD blocklist entries from prior tests")
+			clearCephOSDBlocklist()
 			requireNoSBRNodeHealthCheck()
 
 			// The minimum sbrTimeoutSeconds (10) halves to a 5s heartbeat interval, the tightest
@@ -73,6 +75,9 @@ var _ = Describe(
 		})
 
 		AfterAll(func() {
+			By("Clearing any residual Ceph OSD blocklist entries from load test")
+			clearCephOSDBlocklist()
+
 			if testSBRC != nil {
 				By(fmt.Sprintf("Removing StorageBasedRemediationConfig %q", sbrparams.SBRCBlockLoadTestName))
 				deleteSBRCAndWait(testSBRC, sbrparams.SBRCBlockLoadTestName)
