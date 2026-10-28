@@ -1450,8 +1450,8 @@ func uncordonNodeIfNeeded(nodeName string) {
 // node recovers. Intended as an Eventually body.
 //
 // This samples live state, so it can miss a remediation that completes and is deleted between two
-// polls. Specs that cannot tolerate that should start an sbrNodeWatcher before the disruption and
-// read its fencingProven instead.
+// polls. Specs that cannot tolerate that should start recordSBRCR before the disruption and assert
+// EverSaw(..., remediationFenced) on it instead.
 func fencingProven(nodeName string) (*unstructured.Unstructured, error) {
 	sbrCR, pullErr := pullSBRCR(nodeName)
 	if pullErr != nil {

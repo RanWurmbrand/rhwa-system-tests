@@ -150,14 +150,14 @@ var _ = Describe(
 					}
 				}
 
-				By("Starting the StorageBasedRemediation and Node watches before anything is disrupted")
+				By("Recording the StorageBasedRemediation CR and the Node before anything is disrupted")
 
 				// Started here, before the panic, because the remediation can run to completion and be
 				// deleted again in seconds: NHC removes the CR as soon as SBRStorageUnhealthy cycles to
 				// Unknown, and the reconciler drops the out-of-service taint with it. A wait that only
 				// begins after the disruption can miss both and report a failure that never happened.
-				watcher := startSBRNodeWatcher(victimNodeName)
-				DeferCleanup(watcher.stop)
+				sbrCRRec := recordSBRCR(victimNodeName)
+				nodeRec := recordNode(victimNodeName)
 
 				By(fmt.Sprintf("Starting a privileged injector pod on node %q", victimNodeName))
 
@@ -193,24 +193,26 @@ var _ = Describe(
 					victimNodeName, sbrparams.SBRStorageUnhealthyCondition,
 					sbrparams.SBRStorageUnhealthyReasonHeartbeatTimeout)
 
-				By("Waiting for the watcher to report that NHC created a StorageBasedRemediation CR")
+				By("Waiting for NHC to create a StorageBasedRemediation CR")
 
-				Eventually(watcher.remediationCreated, sbrparams.NHCSBRCRCreationTimeout,
+				Eventually(sbrCRRec.EverExisted(), sbrparams.NHCSBRCRCreationTimeout,
 					sbrparams.NHCSBRCRCreationPollInterval).Should(Succeed(),
 					"NHC must create a StorageBasedRemediation CR for node %q", victimNodeName)
 
 				By("Waiting for FencingSucceeded=True and Succeeded=True on the victim's StorageBasedRemediation CR")
 
-				Eventually(watcher.fencingProven, sbrparams.FencingProvenTimeout,
+				Eventually(sbrCRRec.EverSaw("FencingSucceeded=True and Succeeded=True", remediationFenced),
+					sbrparams.FencingProvenTimeout,
 					sbrparams.DefaultPollInterval).Should(Succeed(),
 					"StorageBasedRemediation/%s must reach %s=True and %s=True",
 					victimNodeName, sbrparams.FencingSucceededCondition, sbrparams.SucceededCondition)
 
-				By("Asserting the watcher saw the out-of-service taint on the victim node")
+				By("Asserting the out-of-service taint was observed on the victim node")
 
-				// Asserted from the watcher, not a live read: the reconciler removes the taint again when
+				// Asserted from the recording, not a live read: the reconciler removes the taint again when
 				// NHC deletes the CR, so by the time a read lands the taint can legitimately be gone.
-				Eventually(watcher.outOfServiceTainted, sbrparams.OutOfServiceTaintObservationTimeout,
+				Eventually(nodeRec.EverSaw("the out-of-service taint", hasOutOfServiceTaint),
+					sbrparams.OutOfServiceTaintObservationTimeout,
 					sbrparams.DefaultPollInterval).Should(Succeed(),
 					"Node %q must carry the %s taint while fencing is proven",
 					victimNodeName, sbrparams.OutOfServiceTaintKey)
@@ -235,7 +237,7 @@ var _ = Describe(
 
 				Eventually(func() error {
 					return agentPodReadyOnNode(sbrparams.SBRCBlockNodeHangTestName, victimNodeName)
-				}, sbrparams.BlockFencingStateCheckTimeout,
+				}, sbrparams.BlockAgentReadyAfterRebootTimeout,
 					sbrparams.BlockFencingStateCheckInterval).Should(Succeed(),
 					"The SBRC %q agent pod on node %q must become Ready after it rebooted",
 					sbrparams.SBRCBlockNodeHangTestName, victimNodeName)
@@ -265,7 +267,7 @@ var _ = Describe(
 
 				By("Waiting for NHC to delete the StorageBasedRemediation CR")
 
-				Eventually(watcher.remediationRemoved, sbrparams.SBRCRCleanupTimeout,
+				Eventually(sbrCRRec.Gone(), sbrparams.SBRCRCleanupTimeout,
 					sbrparams.SBRCRCleanupPollInterval).Should(Succeed(),
 					"NHC must delete the StorageBasedRemediation CR for node %q after recovery", victimNodeName)
 

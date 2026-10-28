@@ -393,6 +393,11 @@ const (
 	// BlockFencingStateCheckTimeout is how long to wait for block device slot state to stabilize after reboot.
 	BlockFencingStateCheckTimeout = 5 * time.Minute
 
+	// BlockAgentReadyAfterRebootTimeout is how long to wait for a rebooted node's agent pod to become
+	// Ready. The pod cannot start until the node's Ceph RBD CSI driver registers and maps the shared
+	// volume again, which has been seen to take more than 6 minutes after a reboot on bare metal.
+	BlockAgentReadyAfterRebootTimeout = 10 * time.Minute
+
 	// BlockFencingStateCheckInterval is the polling interval for block device slot state checks.
 	BlockFencingStateCheckInterval = 10 * time.Second
 
@@ -427,6 +432,10 @@ const (
 	// WatchRetryInterval is how long a background watch waits before re-listing after the API server
 	// closes the connection or rejects a stale resourceVersion.
 	WatchRetryInterval = 2 * time.Second
+
+	// WatchStartTimeout is how long a background watch keeps retrying its first list before the spec
+	// fails. The spec does not start its disruption until that list has succeeded.
+	WatchStartTimeout = 1 * time.Minute
 
 	// SysRqExecTimeout bounds the exec calls that probe and fire the SysRq trigger. The panic exec
 	// never returns cleanly, because the node dies mid-stream, so it must not block the spec forever.
