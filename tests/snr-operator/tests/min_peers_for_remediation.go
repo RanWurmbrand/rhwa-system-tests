@@ -72,14 +72,12 @@ var _ = Describe("SNR Agent MinPeersForRemediation",
 			rebootNode, selectErr := helpers.SelectWorkerNode(ctx, APIClient)
 			Expect(selectErr).ToNot(HaveOccurred(), "Failed to select the worker node to reboot")
 			rebootNodeName = rebootNode.Name
-
 			healthyNode, healthyErr := helpers.SelectWorkerNode(ctx, APIClient, rebootNodeName)
 			Expect(healthyErr).ToNot(HaveOccurred(),
 				"Failed to select a second worker node distinct from %q", rebootNodeName)
 			healthyNodeName = healthyNode.Name
 			Expect(healthyNodeName).ToNot(Equal(rebootNodeName),
 				"The two specs must isolate different nodes")
-
 			GinkgoWriter.Printf(
 				"Nodes under test: %s (must reboot), %s (must not reboot); %d Ready workers\n",
 				rebootNodeName, healthyNodeName, readyWorkerCount)
@@ -129,12 +127,10 @@ var _ = Describe("SNR Agent MinPeersForRemediation",
 					By("DeferCleanup: waiting for the rebooted node and its agent to come back")
 
 					removeBlackholeRoutes(agent)
-
 					Expect(helpers.WaitForNodeReady(ctx, APIClient, rebootNodeName,
 						snrparams.DefaultPollInterval, snrparams.NodeReadyTimeout,
 						GinkgoWriter.Printf)).To(Succeed(),
 						"Node %q must return Ready after the isolation reboot", rebootNodeName)
-
 					Eventually(
 						verifyDSPodsRunning, snrparams.DSPodRestartTimeout,
 						snrparams.DefaultPollInterval).Should(Succeed(),
@@ -143,7 +139,16 @@ var _ = Describe("SNR Agent MinPeersForRemediation",
 
 				By("Isolating the agent from the api-server and from every peer agent")
 
-				isolateAgent(agent, snrparams.IsolationRebootHoldDuration)
+				// Not asserted on: the reboot is expected to kill the exec
+				// mid-window, so an error here is the usual shape of success.
+				// The boot ID below is the verdict, and it cannot be reached
+				// by a fault that never applied.
+				if isolationErr := isolateAgent(
+					agent, snrparams.IsolationRebootHoldDuration); isolationErr != nil {
+					GinkgoWriter.Printf(
+						"isolation exec ended early, expected when the node reboots: %v\n",
+						isolationErr)
+				}
 
 				By("Asserting the node under test rebooted")
 
@@ -163,7 +168,6 @@ var _ = Describe("SNR Agent MinPeersForRemediation",
 				// find, and with at least 2 workers it always differs from the
 				// CRD default of 1.
 				minPeersUnderTest := int64(readyWorkerCount)
-
 				agent := prepareIsolatedAgent(ctx, healthyNodeName, routeTool, minPeersUnderTest)
 
 				DeferCleanup(func() {
@@ -174,7 +178,15 @@ var _ = Describe("SNR Agent MinPeersForRemediation",
 
 				By("Isolating the agent from the api-server and from every peer agent")
 
-				isolateAgent(agent, snrparams.IsolationHoldDuration)
+				// Gated, unlike the previous spec: this one asserts that
+				// nothing happened, and nothing happens just as convincingly
+				// when the fault was never applied. The node here is expected
+				// to survive, so the exec runs to completion and its verdict
+				// is trustworthy.
+				Expect(isolateAgent(agent, snrparams.IsolationHoldDuration)).To(Succeed(),
+					"The agent on node %q must really lose the api-server and every peer; "+
+						"without the fault the no-reboot assertion below proves nothing",
+					healthyNodeName)
 
 				By("Asserting the node under test did not reboot and stays Ready")
 
@@ -296,11 +308,9 @@ func prepareIsolatedAgent(
 	apiIPs := apiServerClusterIPs()
 	Expect(apiIPs).ToNot(BeEmpty(),
 		"Service default/kubernetes must report at least one cluster IP to blackhole")
-
 	peerIPs := peerAgentPodIPs(nodeName)
 	Expect(peerIPs).ToNot(BeEmpty(),
 		"Node %q must have at least one peer agent to be cut off from", nodeName)
-
 	blackholeIPs := make([]string, 0, len(apiIPs)+len(peerIPs))
 	blackholeIPs = append(blackholeIPs, apiIPs...)
 	blackholeIPs = append(blackholeIPs, peerIPs...)
@@ -403,7 +413,6 @@ func applySNRCMinPeers(patch []byte, rolloutExpected bool) {
 // agent DaemonSet to settle.
 func setSNRCMinPeers(value int64) {
 	current, found, readErr := currentSNRCMinPeers()
-
 	applySNRCMinPeers(minPeersPatch(value, true), readErr != nil || !found || current != value)
 }
 
@@ -412,7 +421,6 @@ func setSNRCMinPeers(value int64) {
 // applies -- and waits for the agent DaemonSet to settle afterwards.
 func restoreSNRCMinPeers(value int64, found bool) {
 	current, currentFound, readErr := currentSNRCMinPeers()
-
 	applySNRCMinPeers(minPeersPatch(value, found),
 		readErr != nil || currentFound != found || current != value)
 }
@@ -527,26 +535,40 @@ func peerAgentPodIPs(nodeName string) []string {
 // each peer agent -- for hold and then restores them, from inside the pod's
 // own network namespace so the node and its kubelet are untouched. The exec
 // blocks for the whole window, and ends early when a reboot takes the pod with
-// it. Errors are reported but not fatal, because the reboot assertions are the
-// real gate.
-func isolateAgent(agent isolatedAgent, hold time.Duration) {
+// it.
+//
+// It reports whether the blackhole actually went in. That distinction is what
+// keeps the no-reboot spec honest: a node that was never cut off trivially
+// fails to reboot, so without this an injection that silently did nothing
+// reads exactly like the behaviour under test.
+func isolateAgent(agent isolatedAgent, hold time.Duration) error {
 	agentPod, pullErr := pod.Pull(APIClient, agent.podName, medik8sparams.OperatorNs)
 	Expect(pullErr).ToNot(HaveOccurred(), "Failed to pull agent pod %q", agent.podName)
 
 	var script strings.Builder
 
+	// Each failure is recorded rather than aborting, and every delete below
+	// runs unconditionally, so a partial injection still cleans up after
+	// itself -- but the recorded verdict, not the exit status of the last
+	// delete, is what the caller sees. 'sh -c "false; true"' exits 0, so a
+	// ';'-joined script reports only its final command and hides every failed
+	// route add.
+	//
+	// "replace" rather than "add" so a route left behind by an earlier attempt
+	// is not reported as a failure: the address ends up blackholed either way.
+	fmt.Fprint(&script, "rc=0; ")
+
 	for _, blockIP := range agent.blackholeIPs {
-		fmt.Fprintf(&script, "%s route add blackhole %s; ", agent.routeTool, blockIP)
+		fmt.Fprintf(&script, "%s route replace blackhole %s || rc=1; ", agent.routeTool, blockIP)
 	}
 
-	// Separated by ';' rather than '&&' so a failure to add one address still
-	// runs every delete below.
 	fmt.Fprintf(&script, "sleep %d; ", int(hold.Seconds()))
 
 	for _, blockIP := range agent.blackholeIPs {
 		fmt.Fprintf(&script, "%s route delete blackhole %s; ", agent.routeTool, blockIP)
 	}
 
+	fmt.Fprint(&script, "exit $rc")
 	GinkgoWriter.Printf("Blackholing %v inside agent pod %s for %s\n",
 		agent.blackholeIPs, agent.podName, hold)
 	output, execErr := agentPod.ExecCommandWithTimeout(
@@ -554,9 +576,13 @@ func isolateAgent(agent isolatedAgent, hold time.Duration) {
 		snrparams.IsolationExecTimeout,
 		snrparams.ManagerContainerName)
 	if execErr != nil {
-		GinkgoWriter.Printf("WARNING: isolation exec on agent pod %s returned %v (output: %q)\n",
-			agent.podName, execErr, output.String())
+		return fmt.Errorf(
+			"isolation exec on agent pod %s failed, so the blackhole may never have been "+
+				"applied: %w (output: %q)",
+			agent.podName, execErr, strings.TrimSpace(output.String()))
 	}
+
+	return nil
 }
 
 // agentPodIsLive reports whether the named agent pod still exists and is
