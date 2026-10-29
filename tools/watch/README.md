@@ -21,13 +21,17 @@ for the person running the test, not for the test itself.
 ## `snr-watch.sh`
 
 ```bash
-watch -n 5 -d tools/watch/snr-watch.sh
+watch -n 5 -d tools/watch/snr-watch.sh   # Linux, or macOS with `brew install watch`
+tools/watch/snr-watch.sh --loop          # anywhere, no `watch` needed
+tools/watch/snr-watch.sh                 # one snapshot and exit
 ```
 
-`-d` is what makes it useful: it highlights whatever changed since the previous tick, so a
-boot ID flipping or a taint appearing stands out instead of having to be spotted by eye.
-Highlights only survive one tick, though, so for a precise record of *when* something
-changed, log the diffs instead of eyeballing them.
+`-d` is what makes `watch` useful: it highlights whatever changed since the previous tick,
+so a boot ID flipping or a taint appearing stands out instead of having to be spotted by
+eye. macOS ships no `watch`, so `--loop` does the same job in-script, marking every line
+that was not in the previous tick with a leading `*`. Either way the marking only survives
+one tick, so for a precise record of *when* something changed, log the diffs instead of
+eyeballing them.
 
 | Block | Shows |
 | ----- | ----- |
@@ -50,8 +54,9 @@ A rebooting node appears in three stages, and the last is the slowest:
 3. `bootID` changes — only once the kubelet re-registers, so this marks the node coming
    *back*, not going down.
 
-Requires `oc` logged in, plus `python3` and `awk`. Each tick costs one
-`oc get nodes -o json` and three small reads; raise `-n` to reduce API traffic.
+Requires only `oc` logged in and `awk`; it runs on Fedora Linux and macOS alike. Each tick
+is four small reads; raise `-n` to reduce API traffic. `SNR_WATCH_NS` overrides the
+namespace.
 
 ## Adding one
 
@@ -61,6 +66,16 @@ document. Keep to the same shape:
 
 - **Read-only.** No patches, no deletes, no `oc debug`. Someone will run this against a
   cluster mid-test; it must not perturb what is being measured.
+- **Runs on Fedora Linux and on a MacBook.** No `python3` (macOS has none without the
+  Xcode command line tools) — `oc -o custom-columns` plus `awk` covers most needs. Stay
+  within POSIX `awk` (BSD awk on macOS, gawk on Fedora), target bash 3.2, and avoid
+  GNU-only flags on `sed`, `date` and `head`. macOS has no `watch`, so offer a
+  self-refreshing `--loop` as well. Test on both: the failure mode is silently wrong
+  columns, not an error.
+- **Do not let the display churn.** Anything that changes every tick — a pod age in
+  seconds, a timestamp inside the diffed body — marks its line as changed on every
+  refresh and buries the changes that matter. `snr-watch.sh` trims `6m21s` to `6m` for
+  exactly this reason.
 - **Show the spec's own subject.** A remediation test wants nodes and CRs; an upgrade test
   wants CSVs, subscriptions and pod ages. Watch what that spec asserts on.
 - **One screen per tick, stable line order.** `watch -d` diffs the rendered text, so sort

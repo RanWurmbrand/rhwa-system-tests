@@ -114,6 +114,18 @@ reviewers can tell "not applicable" from "not considered".
   before the run, because that is what the assertion actually compares against.
   Add any new script to the catalog in
   [`tools/watch/README.md`](../../tools/watch/README.md).
+- **Watch tools run on Fedora Linux and on a MacBook.** People here run specs
+  from both, so a tool that only works on one is a tool half the team cannot
+  use. In practice: no `python3` (macOS ships none without the Xcode command
+  line tools) — `oc -o custom-columns` and `awk` cover most of what a snapshot
+  needs; stay within POSIX `awk`, since macOS has BSD awk and Fedora has gawk;
+  target bash 3.2, the system bash on macOS, so no associative arrays,
+  `mapfile`, or `${var^^}`; and avoid GNU-only flags on `sed`, `date` and
+  `head`. macOS has no `watch` at all, so a tool meant for `watch -n 5 -d`
+  needs a self-refreshing fallback — see `--loop` in
+  [`snr-watch.sh`](../../tools/watch/snr-watch.sh), which also marks what
+  changed since the previous tick. Run it on both before merging; the failure
+  mode is silent, wrong columns rather than an error.
 - **Absolute dates and versions.** Pin operator versions (`SBR v0.3.0`), not
   "latest". Write dates as `2026-10-14`, not "last week".
 
@@ -181,5 +193,6 @@ the work item is gone or you cannot find it, write `None` and move on.
 - [ ] Known-bug specs gated behind an env var with a `Skip` message
 - [ ] `tests/<operator>/README.md` catalog entry added
 - [ ] Section 11 documents a `tools/watch` command for following the run, and any
-      new watch script is read-only and listed in the `tools/watch` catalog
+      new watch script is read-only, portable to Fedora and macOS, and listed in
+      the `tools/watch` catalog
 - [ ] `make fmt && make lint && make test` pass
