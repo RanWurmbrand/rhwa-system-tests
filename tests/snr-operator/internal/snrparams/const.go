@@ -63,6 +63,59 @@ const (
 	// when it auto-detects the softdog watchdog path after an invalid path is configured.
 	SoftdogAutoDetectMessage = "auto detected softdog path"
 
+	// MinPeersEnvVarName is the agent environment variable the controller
+	// renders from spec.minPeersForRemediation of the SNRC.
+	MinPeersEnvVarName = "MIN_PEERS_FOR_REMEDIATION"
+
+	// MinPeersRemediateAlone is the minPeersForRemediation value that lets an
+	// agent remediate without any peer confirming the diagnosis. The reboot
+	// spec configures it so an isolated node reboots itself.
+	MinPeersRemediateAlone = 0
+
+	// MinWorkersForPeerCheck is the minimum number of Ready worker nodes the
+	// minPeersForRemediation specs need: one worker to isolate and reboot,
+	// a second to isolate without rebooting, and a peer for each of them --
+	// a node with an empty peer list takes the isolated-node branch whatever
+	// minPeersForRemediation says.
+	MinWorkersForPeerCheck = 2
+
+	// PeerListSettleTimeout is how long the agent pods must stay Running after
+	// a DaemonSet rollout before a fault is injected, so that every agent has
+	// a complete peer list and sees the peers that rolled after it.
+	//
+	// It is sized against the agent's *error* retry, not peerUpdateInterval:
+	// that defaults to 15m, far too long to wait out. An agent that lists its
+	// peers while a sibling pod is missing gets an error back from
+	// mapNodesToPrimaryPodIPs along with the short list, and errors put it on
+	// a quickPeerUpdateInterval loop of 2m until the list comes back clean.
+	// Waiting past that, rather than past peerUpdateInterval, is what makes
+	// the peer list trustworthy.
+	PeerListSettleTimeout = 3 * time.Minute
+
+	// IsolationHoldDuration is how long the api-server and peer agent
+	// addresses stay blackholed inside the agent pod when the node is not
+	// expected to reboot. It must exceed maxApiErrorThreshold *
+	// apiCheckInterval (3 * 15s by default) so the agent reaches the
+	// peer-check path.
+	IsolationHoldDuration = 2 * time.Minute
+
+	// IsolationRebootHoldDuration is the same window for the spec that does
+	// expect a reboot. It must outlast the agent reaching its verdict plus
+	// the watchdog timeout that follows, so the isolation is never lifted
+	// before the node goes down. The exec ends early anyway, when the reboot
+	// takes the agent pod with it.
+	IsolationRebootHoldDuration = 5 * time.Minute
+
+	// IsolationExecTimeout bounds the blocking exec that injects and then
+	// removes the blackhole routes. It must exceed every hold duration above.
+	IsolationExecTimeout = 8 * time.Minute
+
+	// RebootSettleWindow is how long the node that must not reboot is watched
+	// after its isolation window closes. The agent reaches its verdict partway
+	// into that window and a watchdog reboot lands some way after it, so a
+	// single reading at the end of the window could miss a late reboot.
+	RebootSettleWindow = 1 * time.Minute
+
 	// SNRReasonConfigNotFound is the status condition reason when SNRC is missing.
 	SNRReasonConfigNotFound = "ConfigurationNotFound"
 

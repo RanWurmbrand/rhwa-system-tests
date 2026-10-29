@@ -46,6 +46,8 @@ and destructive remediation (kubelet stop, node reboot via NHC detection).
 - For destructive worker tests (15-17): NHC operator installed, 2+ worker nodes
 - For destructive master tests (18-19): NHC operator installed, 1+ worker nodes,
   3+ master nodes for etcd quorum safety
+- For the minPeersForRemediation test (20): 2+ Ready worker nodes; no NHC, SSH
+  or kubelet-stop command needed
 
 ## Running
 
@@ -265,6 +267,8 @@ for a non-destructive lane until that is fixed. Full specification: [docs/TESTCA
 Tests that stop kubelet on nodes, triggering NHC-based health detection
 and SNR remediation with node reboots. Require NHC operator installed,
 2+ worker nodes, and 3+ master nodes. Run time: ~5-10 minutes per test.
+Test 20 is the exception: it injects a network fault inside an agent pod
+rather than touching a node, needs no NHC, and expects no reboot.
 
 ### 16. Verify Worker Node Remediation After Kubelet Stop ([OCP-52416](https://polarion.engineering.redhat.com/polarion/#/project/OSE/workitem?id=OCP-52416))
 
@@ -327,6 +331,28 @@ concurrently -- both reboot and recover independently.
 - **Standalone**: `ginkgo --label-filter="snr" --focus="simultaneously" ./tests/snr-operator/...`
 - **Pass criteria**: Both nodes rebooted (boot IDs changed), creation timestamps unchanged (not deleted/recreated), both recovered to Ready state
 
+### 20. Verify an Isolated SNR Agent Honours the Configured minPeersForRemediation ([RHWA-1972](https://redhat.atlassian.net/browse/RHWA-1972))
+
+Regression test for [RHWA-1872](https://redhat.atlassian.net/browse/RHWA-1872):
+the agent never read `MIN_PEERS_FOR_REMEDIATION` and used 0 regardless of
+`SelfNodeRemediationConfig.spec.minPeersForRemediation`. Two specs inject the
+same fault on two different workers -- the agent pod is cut off from the
+api-server cluster IPs *and* from every peer agent pod IP, inside its own
+network namespace -- and differ only in the configured minimum. With the
+minimum at 0 the isolated agent reboots its node; with the minimum at the Ready
+worker count, one more than any single worker can observe, it must leave the
+node alone. The first spec is the positive control that makes the second one
+mean something. No node, kubelet or host route is touched directly, and the
+routes are removed by the command that adds them.
+Test case: [docs/TESTCASES/rhwa-1972.md](../../docs/TESTCASES/rhwa-1972.md).
+
+- **Operators**: SNR 5.8.0+ (self-node-remediation PR #363)
+- **Cluster**: Multi-node with 2+ Ready workers (skips below that)
+- **Environment**: Connected or disconnected; no NHC, SSH or storage needed
+- **Destructive**: Reboots one worker node (two on a pre-fix build), waiting each back to Ready
+- **Watching it**: `watch -n 5 -d tools/watch/snr-watch.sh` shows node Ready/cordon/boot ID/taints, remediation CRs, the live `minPeersForRemediation` and the agent pods -- see [tools/watch](../../tools/watch/README.md)
+- **Standalone**: `ginkgo --label-filter="operator:snr && tier:resiliency" --focus="isolated agent" ./tests/snr-operator/...`
+- **Pass criteria**: Both agent pods carry `MIN_PEERS_FOR_REMEDIATION` equal to the configured value; the node isolated with minimum 0 reboots (new boot ID); the node isolated with the minimum out of reach keeps its boot ID and stays Ready for a minute past the isolation window; both nodes Ready, blackhole routes gone and the original `minPeersForRemediation` restored
 ### 20. Verify SNR Manages the Agent DaemonSet NetworkPolicy ([RHWA-1645](https://redhat.atlassian.net/browse/RHWA-1645))
 
 Validates that the operator renders, owns, and reconciles the
