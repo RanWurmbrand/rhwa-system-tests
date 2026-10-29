@@ -79,9 +79,9 @@ reviewers can tell "not applicable" from "not considered".
 | 8 | Failure / known issues    | Open bugs, their effect, and the gate used — or `None`                         |
 | 9 | Cleanup                   | What `DeferCleanup` and `AfterAll` each remove, and the recovery steps         |
 | 10 | Labels                   | The exact `Label(…)` block from the spec                                       |
-| 11 | Running it standalone    | A copy-pasteable `ginkgo` command                                              |
+| 11 | Running it standalone    | A copy-pasteable `ginkgo` command, plus the `tools/watch` command for following the run                        |
 | 12 | Implementation sketch    | The spec skeleton, or a link to the merged spec once implemented               |
-| 13 | Documentation to update  | Suite `README.md` entry, and any guide that changes                            |
+| 13 | Documentation to update  | Suite `README.md` entry, the `tools/watch` catalog when a watch script is added or changed, and any guide that changes |
 
 ## Expectations for the document
 
@@ -99,6 +99,21 @@ reviewers can tell "not applicable" from "not considered".
 - **Destructive is declared.** If the test reboots, fences, cordons, stops a
   kubelet, or injects a network fault, say so in section 4 and label the spec
   `labels.DisruptionDestructive`.
+- **Give the person running it something to watch.** Specs here are routinely run
+  one at a time against a live cluster, and the state that matters lives on the
+  cluster rather than in the Ginkgo log — which reports a step only once it has
+  finished, and by then the evidence has often already healed. This is not just a
+  destructive-test concern: an operator rolling out, a CR moving through its
+  conditions, pods churning during an upgrade are all easier to follow live than
+  to reconstruct afterwards, and a run that is going wrong is obvious minutes
+  before Ginkgo says so. Give the runner a read-only snapshot script under
+  [`tools/watch`](../../tools/watch): reuse an existing one where it fits, add a
+  new one where it does not. Document the exact `watch -n 5 -d …` invocation in
+  section 11, say what each block shows, and name the values that must change and
+  the ones that must not — record the baseline (boot IDs, for a reboot test)
+  before the run, because that is what the assertion actually compares against.
+  Add any new script to the catalog in
+  [`tools/watch/README.md`](../../tools/watch/README.md).
 - **Absolute dates and versions.** Pin operator versions (`SBR v0.3.0`), not
   "latest". Write dates as `2026-10-14`, not "last week".
 
@@ -165,4 +180,6 @@ the work item is gone or you cannot find it, write `None` and move on.
 - [ ] Cleanup idempotent and `IsNotFound`-tolerant
 - [ ] Known-bug specs gated behind an env var with a `Skip` message
 - [ ] `tests/<operator>/README.md` catalog entry added
+- [ ] Section 11 documents a `tools/watch` command for following the run, and any
+      new watch script is read-only and listed in the `tools/watch` catalog
 - [ ] `make fmt && make lint && make test` pass

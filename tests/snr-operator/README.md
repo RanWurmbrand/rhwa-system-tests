@@ -331,20 +331,25 @@ concurrently -- both reboot and recover independently.
 - **Standalone**: `ginkgo --label-filter="snr" --focus="simultaneously" ./tests/snr-operator/...`
 - **Pass criteria**: Both nodes rebooted (boot IDs changed), creation timestamps unchanged (not deleted/recreated), both recovered to Ready state
 
-### 20. Verify the SNR Agent Uses the Configured minPeersForRemediation ([RHWA-1972](https://redhat.atlassian.net/browse/RHWA-1972))
+### 20. Verify an Isolated SNR Agent Honours the Configured minPeersForRemediation ([RHWA-1972](https://redhat.atlassian.net/browse/RHWA-1972))
 
 Regression test for [RHWA-1872](https://redhat.atlassian.net/browse/RHWA-1872):
 the agent never read `MIN_PEERS_FOR_REMEDIATION` and used 0 regardless of
-`SelfNodeRemediationConfig.spec.minPeersForRemediation`. Sets the minimum to the
-Ready worker count -- one more than any single worker can observe -- then
-blackholes the api-server cluster IPs inside the agent pod's own network
-namespace for 2 minutes and checks the agent refuses to consult peers, naming
-the configured minimum. The node, its kubelet and every other pod keep full
-api-server access, and the routes are removed by the command that adds them.
+`SelfNodeRemediationConfig.spec.minPeersForRemediation`. Two specs inject the
+same fault on two different workers -- the agent pod is cut off from the
+api-server cluster IPs *and* from every peer agent pod IP, inside its own
+network namespace -- and differ only in the configured minimum. With the
+minimum at 0 the isolated agent reboots its node; with the minimum at the Ready
+worker count, one more than any single worker can observe, it must leave the
+node alone. The first spec is the positive control that makes the second one
+mean something. No node, kubelet or host route is touched directly, and the
+routes are removed by the command that adds them.
 Test case: [docs/TESTCASES/rhwa-1972.md](../../docs/TESTCASES/rhwa-1972.md).
 
 - **Operators**: SNR 5.8.0+ (self-node-remediation PR #363)
 - **Cluster**: Multi-node with 2+ Ready workers (skips below that)
 - **Environment**: Connected or disconnected; no NHC, SSH or storage needed
-- **Standalone**: `ginkgo --label-filter="operator:snr && tier:resiliency" --focus="configured minPeersForRemediation value" ./tests/snr-operator/...`
-- **Pass criteria**: Agent pod carries `MIN_PEERS_FOR_REMEDIATION` equal to the configured value and logs `insufficient number of peers found` with `"minPeersRequired": <worker count>`; node boot ID unchanged and node still Ready; blackhole routes gone and the original `minPeersForRemediation` restored
+- **Destructive**: Reboots one worker node (two on a pre-fix build), waiting each back to Ready
+- **Watching it**: `watch -n 5 -d tools/watch/snr-watch.sh` shows node Ready/cordon/boot ID/taints, remediation CRs, the live `minPeersForRemediation` and the agent pods -- see [tools/watch](../../tools/watch/README.md)
+- **Standalone**: `ginkgo --label-filter="operator:snr && tier:resiliency" --focus="isolated agent" ./tests/snr-operator/...`
+- **Pass criteria**: Both agent pods carry `MIN_PEERS_FOR_REMEDIATION` equal to the configured value; the node isolated with minimum 0 reboots (new boot ID); the node isolated with the minimum out of reach keeps its boot ID and stays Ready for a minute past the isolation window; both nodes Ready, blackhole routes gone and the original `minPeersForRemediation` restored
