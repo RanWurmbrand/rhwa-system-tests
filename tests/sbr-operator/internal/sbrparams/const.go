@@ -394,6 +394,11 @@ const (
 	// BlockFencingStateCheckTimeout is how long to wait for block device slot state to stabilize after reboot.
 	BlockFencingStateCheckTimeout = 5 * time.Minute
 
+	// BlockAgentReadyAfterRebootTimeout is how long to wait for a rebooted node's agent pod to become
+	// Ready. The pod cannot start until the node's Ceph RBD CSI driver registers and maps the shared
+	// volume again, which has been seen to take more than 6 minutes after a reboot on bare metal.
+	BlockAgentReadyAfterRebootTimeout = 10 * time.Minute
+
 	// BlockFencingStateCheckInterval is the polling interval for block device slot state checks.
 	BlockFencingStateCheckInterval = 10 * time.Second
 
@@ -420,6 +425,27 @@ const (
 	// OutOfServiceTaintKey is the taint the reconciler applies to a fenced node once death is proven
 	// (node.kubernetes.io/out-of-service=nodeshutdown:NoExecute), and removes again on CR deletion.
 	OutOfServiceTaintKey = "node.kubernetes.io/out-of-service"
+
+	// SBRCRResource is the plural resource name of StorageBasedRemediation, used to build the
+	// GroupVersionResource that the background watcher needs for a dynamic watch.
+	SBRCRResource = "storagebasedremediations"
+
+	// WatchRetryInterval is how long a background watch waits before re-listing after the API server
+	// closes the connection or rejects a stale resourceVersion.
+	WatchRetryInterval = 2 * time.Second
+
+	// WatchStartTimeout is how long a background watch keeps retrying its first list before the spec
+	// fails. The spec does not start its disruption until that list has succeeded.
+	WatchStartTimeout = 1 * time.Minute
+
+	// SysRqExecTimeout bounds the exec calls that probe and fire the SysRq trigger. The panic exec
+	// never returns cleanly, because the node dies mid-stream, so it must not block the spec forever.
+	SysRqExecTimeout = 30 * time.Second
+
+	// OutOfServiceTaintObservationTimeout is how long to wait for the watcher to report the
+	// out-of-service taint once fencing is proven. The reconciler applies the taint in the same
+	// reconcile that sets the conditions, so this only has to cover watch delivery lag.
+	OutOfServiceTaintObservationTimeout = 2 * time.Minute
 
 	// SBRCBlockTransientTestName is the SBRC name for the Ceph RBD transient network partition test.
 	SBRCBlockTransientTestName = "test-sbrc-block-transient"

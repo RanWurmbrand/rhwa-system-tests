@@ -1545,21 +1545,29 @@ func startPrivilegedInjectorPod(nodeName, podName string) (*pod.Builder, error) 
 // /proc/sysrq-trigger is writable on the host. The probe output is returned alongside the error so
 // the caller can report it.
 func sysRqTriggerWritable(injectorPod *pod.Builder) (string, error) {
-	probeOut, probeErr := injectorPod.ExecCommand([]string{
+	probeOut, probeErr := injectorPod.ExecCommandWithTimeout([]string{
 		"nsenter", "-t", "1", "--pid", "--mount", "--", "sh", "-c",
 		"test -w /proc/sysrq-trigger",
-	})
+	}, sbrparams.SysRqExecTimeout)
 
 	return probeOut.String(), probeErr
 }
 
 // fireSysRqKernelPanic crashes the injector pod's host node through the SysRq trigger. The exec is
-// fire-and-forget: the node reboots immediately, so the command never returns cleanly.
+// fire-and-forget: the node dies mid-stream, so the command never returns cleanly and its error is
+// logged rather than asserted. It is still logged, because the command also enables SysRq
+// (echo 1 > /proc/sys/kernel/sysrq), which sysRqTriggerWritable does not cover; if that part fails
+// the node never panics and the only other symptom is a distant timeout waiting for the condition.
+// The timeout bounds the exec so a half-open stream to a dead node cannot hang the spec.
 func fireSysRqKernelPanic(injectorPod *pod.Builder) {
-	_, _ = injectorPod.ExecCommand([]string{
+	out, execErr := injectorPod.ExecCommandWithTimeout([]string{
 		"nsenter", "-t", "1", "--pid", "--mount", "--", "sh", "-c",
 		"echo 1 > /proc/sys/kernel/sysrq && echo c > /proc/sysrq-trigger",
-	})
+	}, sbrparams.SysRqExecTimeout)
+	if execErr != nil {
+		GinkgoWriter.Printf("SysRq panic exec on pod %s returned %v (expected: the node dies mid-exec); "+
+			"output: %s\n", injectorPod.Definition.Name, execErr, out.String())
+	}
 }
 
 // uncordonNodeIfNeeded clears the unschedulable flag on a node that is still cordoned. Failures are
@@ -1586,11 +1594,13 @@ func uncordonNodeIfNeeded(nodeName string) {
 // fencingProven returns nil once the victim's StorageBasedRemediation CR reports both
 // FencingSucceeded=True and Succeeded=True. The CR is looked up by node name on every call because it
 // can be deleted and recreated mid-remediation when the node's SBRStorageUnhealthy condition cycles to
-// Unknown; a transient NotFound is therefore just "keep waiting". The CR persists after the conditions
-// are set (NHC only deletes it once the node recovers), so there is no "proven then deleted" race to
-// special-case here. The CR as seen at the moment it was proven is returned, so callers can inspect
-// it without re-pulling a CR that NHC may delete once the node recovers. Intended as an Eventually
-// body.
+// Unknown; a transient NotFound is therefore just "keep waiting". The CR as seen at the moment it was
+// proven is returned, so callers can inspect it without re-pulling a CR that NHC may delete once the
+// node recovers. Intended as an Eventually body.
+//
+// This samples live state, so it can miss a remediation that completes and is deleted between two
+// polls. Specs that cannot tolerate that should start recordSBRCR before the disruption and assert
+// EverSaw(..., remediationFenced) on it instead.
 func fencingProven(nodeName string) (*unstructured.Unstructured, error) {
 	sbrCR, pullErr := pullSBRCR(nodeName)
 	if pullErr != nil {

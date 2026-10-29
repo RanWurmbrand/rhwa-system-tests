@@ -399,8 +399,9 @@ a peer agent fences the node; and the reconciler proves death from storage, appl
 the node reboots and rejoins and NHC deletes the CR, the node is uncordoned and the taint is removed.
 
 The block-mode counterpart of the Filesystem node hang test (`node_hang.go`, OCP-88738), with its
-own ID. The CR is looked up by node name on every poll because it can be deleted and recreated
-when `SBRStorageUnhealthy` cycles to `Unknown`; `FencingInProgress` is deliberately not asserted
+own ID. The CR and the Node are recorded (list + watch) from before the panic, because NHC can
+delete the CR, and the reconciler the taint, as soon as `SBRStorageUnhealthy` cycles to `Unknown`;
+`FencingInProgress` is deliberately not asserted
 because the 60s fencing window and 60s staleness threshold make it flap.
 
 Full test case: [docs/TESTCASES/rhwa-1931.md](../../docs/TESTCASES/rhwa-1931.md)
