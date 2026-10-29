@@ -37,6 +37,8 @@ var _ = Describe(
 		)
 
 		BeforeAll(func() {
+			Skip("RHWA-1987: flaky — agent containers not ready after node reboot")
+
 			By("Clearing residual Ceph OSD blocklist entries from prior tests")
 			clearCephOSDBlocklist()
 
