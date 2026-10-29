@@ -283,14 +283,15 @@ const (
 	SBRCDetectOnlyTestName = "test-sbrc-detect-only"
 
 	// WatchdogKeepaliveNamePrefix is the name prefix for privileged pods that hold /dev/watchdog
-	// open during the RHWA-1068 regression test.
+	// open during the RHWA-1184 regression test.
 	WatchdogKeepaliveNamePrefix = "sbr-wdog-keepalive-"
 
-	// WatchdogKeepaliveTimeout is how long to wait for all watchdog-keepalive pods to reach Running.
+	// WatchdogKeepaliveTimeout is how long to wait for a watchdog-keepalive pod to reach Running
+	// or to be deleted.
 	WatchdogKeepaliveTimeout = 2 * time.Minute
 
 	// DetectOnlyAllPodsReadyTimeout is how long to wait for ALL agent DaemonSet pods to reach Ready
-	// in the detect-only watchdog contention regression test (RHWA-1068).
+	// in the detect-only watchdog contention regression test (RHWA-1184).
 	DetectOnlyAllPodsReadyTimeout = 5 * time.Minute
 
 	// DetectOnlySuppressionCheckDuration is how long to Consistently assert no fencing occurs while
