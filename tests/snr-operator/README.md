@@ -353,3 +353,18 @@ Test case: [docs/TESTCASES/rhwa-1972.md](../../docs/TESTCASES/rhwa-1972.md).
 - **Watching it**: `watch -n 5 -d tools/watch/snr-watch.sh` shows node Ready/cordon/boot ID/taints, remediation CRs, the live `minPeersForRemediation` and the agent pods -- see [tools/watch](../../tools/watch/README.md)
 - **Standalone**: `ginkgo --label-filter="operator:snr && tier:resiliency" --focus="isolated agent" ./tests/snr-operator/...`
 - **Pass criteria**: Both agent pods carry `MIN_PEERS_FOR_REMEDIATION` equal to the configured value; the node isolated with minimum 0 reboots (new boot ID); the node isolated with the minimum out of reach keeps its boot ID and stays Ready for a minute past the isolation window; both nodes Ready, blackhole routes gone and the original `minPeersForRemediation` restored
+### 20. Verify SNR Manages the Agent DaemonSet NetworkPolicy ([RHWA-1645](https://redhat.atlassian.net/browse/RHWA-1645))
+
+Validates that the operator renders, owns, and reconciles the
+`self-node-remediation-ds-np` `NetworkPolicy` for the agent DaemonSet: automatic
+creation and ownership by the default `SelfNodeRemediationConfig`, the static
+ingress/egress rules (peer hostPort, DNS, HTTPS, own-node kubelet check),
+recreation after manual deletion, and correct/stable `ipBlock` egress rules
+derived from `EndpointHealthCheckUrl` across resolution, a simulated DNS flip,
+and rapid successive changes.
+
+- **Operators**: SNR v5.8.0
+- **Cluster**: Any topology
+- **Environment**: Connected or disconnected
+- **Standalone**: `ginkgo --label-filter="operator:snr && tier:smoke" --focus="manages the agent DaemonSet NetworkPolicy" ./tests/snr-operator/...`
+- **Pass criteria**: `NetworkPolicy` exists, owned by the config CR, with the expected static rules; recreated after deletion; `ipBlock` egress rule tracks `EndpointHealthCheckUrl` through resolution, a DNS flip, and rapid changes, converging to and holding a single rule with no allow-all fallback. See [docs/TESTCASES/rhwa-1645.md](../../docs/TESTCASES/rhwa-1645.md).

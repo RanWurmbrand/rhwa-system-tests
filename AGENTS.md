@@ -10,6 +10,7 @@ See [docs/TESTCASES/AGENTS.md](docs/TESTCASES/AGENTS.md) for the requirements an
 
 ## Project Conventions for Agents
 
+- **Assert system behavior.** Test assertions must check externally observable system behavior. Use custom resource conditions, status fields, Kubernetes events, node state, reboot results, or workload operation. Do not use log messages or log parsing to determine whether a test passes or fails. Use a log assertion only when no other check can establish the required behavior. Document why no alternative exists in the test case document.
 - **Keep the repository root clean.** Do not add new files to the root unless strictly required by a tool or standard (e.g. `go.mod`, `Makefile`, `LICENSE`). Documentation, guidelines, and agent-specific files belong in subdirectories.
 - **No agent-proprietary directories or files.** Do not create tool-specific directories (e.g. `.claude/`, `.cursor/`) or files unless the tool itself requires it and there is no neutral alternative. Use `.agents/` for cross-agent content.
 - **Prefer `AGENTS.md` over `CLAUDE.md`.** All project guidance goes in `AGENTS.md`. `CLAUDE.md` exists only as a redirect stub; do not add content to it.

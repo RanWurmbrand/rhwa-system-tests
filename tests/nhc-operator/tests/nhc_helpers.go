@@ -22,6 +22,8 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -274,6 +276,56 @@ func cleanupNHCCR(ctx context.Context, name string) bool {
 	return gone
 }
 
+// listNHCsSelectingNode returns the names of the NHC CRs whose spec.selector
+// matches the given node labels. A CR without a selector matches every node.
+// NHC remediates only one CR at a time, so a spec that needs its own CR to
+// reach Remediating must first clear any of these left behind by an
+// interrupted sibling spec.
+func listNHCsSelectingNode(ctx context.Context, nodeLabels map[string]string) ([]string, error) {
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(nhcGVK.GroupVersion().WithKind(nhcGVK.Kind + "List"))
+
+	if err := APIClient.List(ctx, list); err != nil {
+		return nil, fmt.Errorf("list NHC CRs: %w", err)
+	}
+
+	nodeLabelSet := labels.Set(nodeLabels)
+	names := make([]string, 0, len(list.Items))
+
+	for idx := range list.Items {
+		selector, err := nhcSelector(&list.Items[idx])
+		if err != nil {
+			return nil, err
+		}
+
+		if selector.Matches(nodeLabelSet) {
+			names = append(names, list.Items[idx].GetName())
+		}
+	}
+
+	return names, nil
+}
+
+// nhcSelector converts an NHC CR's spec.selector into a labels.Selector. An
+// absent selector is the empty LabelSelector, which matches every node.
+func nhcSelector(nhc *unstructured.Unstructured) (labels.Selector, error) {
+	rawSelector, found, err := unstructured.NestedMap(nhc.Object, "spec", "selector")
+	if err != nil {
+		return nil, fmt.Errorf("read spec.selector of NHC CR %s: %w", nhc.GetName(), err)
+	}
+
+	var selector metav1.LabelSelector
+
+	if found {
+		convErr := runtime.DefaultUnstructuredConverter.FromUnstructured(rawSelector, &selector)
+		if convErr != nil {
+			return nil, fmt.Errorf("parse spec.selector of NHC CR %s: %w", nhc.GetName(), convErr)
+		}
+	}
+
+	return metav1.LabelSelectorAsSelector(&selector)
+}
+
 // listStaleTestNHCs returns the NHC CRs left by an earlier spec (names
 // starting with nhcparams.TestNHCNamePrefix). A leftover NHC keeps watching all
 // workers and takes ownership of remediation CRs for nodes that later specs disrupt.
@@ -363,13 +415,24 @@ func listSNRCRsForNode(ctx context.Context, nodeName string) ([]unstructured.Uns
 
 	for i := range list.Items {
 		item := list.Items[i]
-		if item.GetName() == nodeName ||
-			item.GetAnnotations()["remediation.medik8s.io/node-name"] == nodeName {
+		if snrCRMatchesNode(item.GetName(), item.GetAnnotations(), nodeName) {
 			items = append(items, item)
 		}
 	}
 
 	return items, nil
+}
+
+// snrCRMatchesNode reports whether an SNR CR belongs to the named node. NHC
+// creates SNR CRs named either exactly after the node or with a random suffix
+// (e.g. "worker-0-8lwbf"), so both forms must match -- the separator is required
+// so that node "worker-0" does not claim a CR belonging to "worker-01".
+// listSNRCRsForNode and snrCRExists share this so the create-gate, the cleanup
+// and the completion wait cannot disagree about which CRs exist.
+func snrCRMatchesNode(crName string, annotations map[string]string, nodeName string) bool {
+	return crName == nodeName ||
+		strings.HasPrefix(crName, nodeName+"-") ||
+		annotations["remediation.medik8s.io/node-name"] == nodeName
 }
 
 // getNHCPhase returns the current .status.phase of the named NHC CR.
@@ -1182,7 +1245,8 @@ func snrCRExists(ctx context.Context, nodeName string) (bool, error) {
 	}
 
 	for i := range snrList.Items {
-		if strings.HasPrefix(snrList.Items[i].GetName(), nodeName) {
+		if snrCRMatchesNode(
+			snrList.Items[i].GetName(), snrList.Items[i].GetAnnotations(), nodeName) {
 			return true, nil
 		}
 	}

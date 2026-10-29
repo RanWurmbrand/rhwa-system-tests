@@ -283,14 +283,15 @@ const (
 	SBRCDetectOnlyTestName = "test-sbrc-detect-only"
 
 	// WatchdogKeepaliveNamePrefix is the name prefix for privileged pods that hold /dev/watchdog
-	// open during the RHWA-1068 regression test.
+	// open during the RHWA-1184 regression test.
 	WatchdogKeepaliveNamePrefix = "sbr-wdog-keepalive-"
 
-	// WatchdogKeepaliveTimeout is how long to wait for all watchdog-keepalive pods to reach Running.
+	// WatchdogKeepaliveTimeout is how long to wait for a watchdog-keepalive pod to reach Running
+	// or to be deleted.
 	WatchdogKeepaliveTimeout = 2 * time.Minute
 
 	// DetectOnlyAllPodsReadyTimeout is how long to wait for ALL agent DaemonSet pods to reach Ready
-	// in the detect-only watchdog contention regression test (RHWA-1068).
+	// in the detect-only watchdog contention regression test (RHWA-1184).
 	DetectOnlyAllPodsReadyTimeout = 5 * time.Minute
 
 	// DetectOnlySuppressionCheckDuration is how long to Consistently assert no fencing occurs while
@@ -393,6 +394,11 @@ const (
 	// BlockFencingStateCheckTimeout is how long to wait for block device slot state to stabilize after reboot.
 	BlockFencingStateCheckTimeout = 5 * time.Minute
 
+	// BlockAgentReadyAfterRebootTimeout is how long to wait for a rebooted node's agent pod to become
+	// Ready. The pod cannot start until the node's Ceph RBD CSI driver registers and maps the shared
+	// volume again, which has been seen to take more than 6 minutes after a reboot on bare metal.
+	BlockAgentReadyAfterRebootTimeout = 10 * time.Minute
+
 	// BlockFencingStateCheckInterval is the polling interval for block device slot state checks.
 	BlockFencingStateCheckInterval = 10 * time.Second
 
@@ -419,6 +425,27 @@ const (
 	// OutOfServiceTaintKey is the taint the reconciler applies to a fenced node once death is proven
 	// (node.kubernetes.io/out-of-service=nodeshutdown:NoExecute), and removes again on CR deletion.
 	OutOfServiceTaintKey = "node.kubernetes.io/out-of-service"
+
+	// SBRCRResource is the plural resource name of StorageBasedRemediation, used to build the
+	// GroupVersionResource that the background watcher needs for a dynamic watch.
+	SBRCRResource = "storagebasedremediations"
+
+	// WatchRetryInterval is how long a background watch waits before re-listing after the API server
+	// closes the connection or rejects a stale resourceVersion.
+	WatchRetryInterval = 2 * time.Second
+
+	// WatchStartTimeout is how long a background watch keeps retrying its first list before the spec
+	// fails. The spec does not start its disruption until that list has succeeded.
+	WatchStartTimeout = 1 * time.Minute
+
+	// SysRqExecTimeout bounds the exec calls that probe and fire the SysRq trigger. The panic exec
+	// never returns cleanly, because the node dies mid-stream, so it must not block the spec forever.
+	SysRqExecTimeout = 30 * time.Second
+
+	// OutOfServiceTaintObservationTimeout is how long to wait for the watcher to report the
+	// out-of-service taint once fencing is proven. The reconciler applies the taint in the same
+	// reconcile that sets the conditions, so this only has to cover watch delivery lag.
+	OutOfServiceTaintObservationTimeout = 2 * time.Minute
 
 	// SBRCBlockTransientTestName is the SBRC name for the Ceph RBD transient network partition test.
 	SBRCBlockTransientTestName = "test-sbrc-block-transient"
@@ -585,6 +612,49 @@ const (
 
 	// AgentReadinessSuccessThreshold is the agent readiness probe's successThreshold.
 	AgentReadinessSuccessThreshold int32 = 1
+
+	// NetworkPolicyNamePrefix is the naming prefix the SBRC controller uses for the agent
+	// NetworkPolicy. It is identical to SBRAgentDaemonSetPrefix: both render as
+	// "sbr-agent-<sbrcName>".
+	NetworkPolicyNamePrefix = SBRAgentDaemonSetPrefix
+
+	// AgentAppLabelValue is the "app" label value stamped on agent pods and read back into the
+	// NetworkPolicy's podSelector/peer selectors.
+	AgentAppLabelValue = "sbr-agent"
+
+	// RuntimeMetricsPort is the controller-runtime metrics port the agent NetworkPolicy allows
+	// ingress to, alongside AgentMetricsPort.
+	RuntimeMetricsPort = int32(8080)
+
+	// MetricsNamespaceSelectorLabelKey is the label key that scopes the agent NetworkPolicy's
+	// ingress rule on the metrics ports to namespaces carrying this label (e.g.
+	// openshift-monitoring).
+	MetricsNamespaceSelectorLabelKey = "metrics"
+
+	// MetricsNamespaceSelectorLabelValue is the label value paired with
+	// MetricsNamespaceSelectorLabelKey.
+	MetricsNamespaceSelectorLabelValue = "enabled"
+
+	// ExpectedOpenShiftMonitoringNamespace is the namespace the operator checks for the
+	// MetricsNamespaceSelectorLabelKey/Value label before warning that Prometheus will be cut off
+	// from the agent metrics ports.
+	ExpectedOpenShiftMonitoringNamespace = "openshift-monitoring"
+
+	// MetricsNamespaceLabelMissingEventReason is the Warning event reason the operator emits on
+	// the StorageBasedRemediationConfig when ExpectedOpenShiftMonitoringNamespace lacks the
+	// metrics label.
+	MetricsNamespaceLabelMissingEventReason = "MetricsNamespaceLabelMissing"
+
+	// NetworkPolicyManagedEventReason is the Normal event reason the operator emits when it
+	// creates or updates the agent NetworkPolicy.
+	NetworkPolicyManagedEventReason = "NetworkPolicyManaged"
+
+	// SBRCNetworkPolicyTestName is the SBRC name used by the agent NetworkPolicy test.
+	SBRCNetworkPolicyTestName = "test-sbrc-network-policy"
+
+	// NetworkPolicyRecreateTimeout bounds the wait for the operator to recreate the agent
+	// NetworkPolicy after it is deleted out-of-band, and for a drifted spec to be restored.
+	NetworkPolicyRecreateTimeout = 2 * time.Minute
 )
 
 // AgentProbeForbiddenSubstrings are the fragments of a host process-table scan that must never

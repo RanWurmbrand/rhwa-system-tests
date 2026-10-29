@@ -44,6 +44,13 @@ func getNodeBootID(nodeName string) (string, error) {
 	return bootID, nil
 }
 
+// nsenterCmd is the nsenter binary name used to enter host namespaces.
+// nsenterMountFlag is the --mount flag passed to nsenter to enter the host mount namespace.
+const (
+	nsenterCmd       = "nsenter"
+	nsenterMountFlag = "--mount"
+)
+
 // cephFSRejectBidirectional defines nsenter + iptables REJECT rules for both INPUT and OUTPUT
 // chains covering all CephFS port groups: 3300 (msgr2), 6789 (msgr1 mon), 6800-7300 (OSD/MDS).
 var cephFSRejectBidirectional = [][]string{
@@ -1097,6 +1104,148 @@ func verifyODFFenceRemoved(out, fenceRange string) error {
 	return nil
 }
 
+// clearCephOSDBlocklist removes all Ceph OSD blocklist entries left by destructive fencing
+// tests. Residual blocklist entries from prior test suites can cause heartbeat regression in
+// subsequent tests (e.g. heartbeat sequence drops from ~13 to ~7 under CPU stress). Call
+// this in AfterAll teardown to ensure a clean slate. Failures are logged as warnings; cleanup
+// is best-effort so it never masks the test result.
+func clearCephOSDBlocklist() {
+	rookPods, err := pod.List(APIClient, sbrparams.ODFNamespace,
+		metav1.ListOptions{LabelSelector: sbrparams.RookOperatorPodLabelSelector})
+
+	var rookPod *pod.Builder
+
+	for _, candidate := range rookPods {
+		if candidate.Object.Status.Phase == corev1.PodRunning && candidate.Object.DeletionTimestamp == nil {
+			rookPod = candidate
+
+			break
+		}
+	}
+
+	if err != nil || rookPod == nil {
+		GinkgoWriter.Printf("Warning: Ceph OSD blocklist clear skipped: "+
+			"no running Rook operator pod in %s (err: %v)\n",
+			sbrparams.ODFNamespace, err)
+
+		return
+	}
+
+	cephCmd := func(args ...string) (string, error) {
+		cmd := append([]string{"ceph", "--conf", sbrparams.RookCephConfig, "--connect-timeout", "30"}, args...)
+		out, execErr := rookPod.ExecCommandWithTimeout(cmd, sbrparams.StaleODFFenceTimeout,
+			sbrparams.RookOperatorContainer)
+
+		return out.String(), execErr
+	}
+
+	out, lsErr := cephCmd("osd", "blocklist", "ls", "--format", "json")
+	if lsErr != nil {
+		GinkgoWriter.Printf("Warning: ceph osd blocklist ls failed during teardown: %v: %s\n", lsErr, out)
+
+		return
+	}
+
+	entries, parsed := parseODFBlocklist(out)
+	if !parsed {
+		GinkgoWriter.Printf("Warning: cannot parse Ceph OSD blocklist output during teardown: %q\n", out)
+
+		return
+	}
+
+	if len(entries) == 0 {
+		GinkgoWriter.Printf("Ceph OSD blocklist is empty; no teardown cleanup needed\n")
+
+		return
+	}
+
+	GinkgoWriter.Printf("Clearing %d Ceph OSD blocklist entries left by fencing test\n", len(entries))
+
+	for _, entry := range entries {
+		if entry.Range != "" {
+			cidr := strings.Replace(entry.Range, ":0/", "/", 1)
+			rmOut, rmErr := cephCmd("osd", "blocklist", "range", "rm", cidr)
+			if rmErr != nil {
+				GinkgoWriter.Printf("Warning: ceph osd blocklist range rm %s: %v: %s\n", cidr, rmErr, rmOut)
+			} else {
+				GinkgoWriter.Printf("Removed Ceph OSD blocklist range %s (until %s)\n", cidr, entry.Until)
+			}
+		} else if entry.Addr != "" {
+			rmOut, rmErr := cephCmd("osd", "blocklist", "rm", entry.Addr)
+			if rmErr != nil {
+				GinkgoWriter.Printf("Warning: ceph osd blocklist rm %s: %v: %s\n",
+					entry.Addr, rmErr, rmOut)
+			} else {
+				GinkgoWriter.Printf("Removed Ceph OSD blocklist entry %s (until %s)\n",
+					entry.Addr, entry.Until)
+			}
+		}
+	}
+}
+
+// verifyCephFSIPTablesClean verifies that no test-injected CephFS REJECT rules remain in
+// the host iptables on the target node. It lists the OUTPUT and INPUT chains through the
+// injector pod and removes any residual Ceph REJECT rules found. This prevents iptables
+// rule leakage between test suites that can cause inter-test pollution.
+func verifyCephFSIPTablesClean(injectorPod *pod.Builder) {
+	const maxRemovalAttempts = 10
+	cephPorts := []string{"3300", "6789", "6800:7300"}
+
+	for attempt := 1; attempt <= maxRemovalAttempts; attempt++ {
+		outputRules, outputErr := injectorPod.ExecCommand([]string{
+			nsenterCmd, "--target", "1", "--net", nsenterMountFlag, "--",
+			"iptables", "-S", "OUTPUT",
+		})
+		if outputErr != nil {
+			GinkgoWriter.Printf("Warning: cannot list OUTPUT chain for iptables verification: %v\n", outputErr)
+
+			return
+		}
+
+		inputRules, inputErr := injectorPod.ExecCommand([]string{
+			nsenterCmd, "--target", "1", "--net", nsenterMountFlag, "--",
+			"iptables", "-S", "INPUT",
+		})
+		if inputErr != nil {
+			GinkgoWriter.Printf("Warning: cannot list INPUT chain for iptables verification: %v\n", inputErr)
+
+			return
+		}
+
+		residualFound := false
+		allRules := outputRules.String() + "\n" + inputRules.String()
+
+		for _, line := range strings.Split(allRules, "\n") {
+			if !strings.Contains(line, "REJECT") {
+				continue
+			}
+
+			for _, port := range cephPorts {
+				if strings.Contains(line, port) {
+					GinkgoWriter.Printf("Warning: residual Ceph iptables REJECT rule found after teardown "+
+						"(attempt %d/%d): %s\n", attempt, maxRemovalAttempts, strings.TrimSpace(line))
+					residualFound = true
+
+					break
+				}
+			}
+		}
+
+		if !residualFound {
+			GinkgoWriter.Printf("Verified: no residual CephFS iptables REJECT rules remain after teardown\n")
+
+			return
+		}
+
+		GinkgoWriter.Printf("Removing residual CephFS iptables REJECT rules (attempt %d/%d)\n",
+			attempt, maxRemovalAttempts)
+		removeCephFSRejectBidirectional(injectorPod)
+	}
+
+	GinkgoWriter.Printf("Warning: residual CephFS iptables REJECT rules still present after %d removal attempts\n",
+		maxRemovalAttempts)
+}
+
 func odfFenceNodeRecovered(ctx context.Context, nodeName string) error {
 	node, err := APIClient.CoreV1Interface.Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 	if err != nil {
@@ -1396,21 +1545,29 @@ func startPrivilegedInjectorPod(nodeName, podName string) (*pod.Builder, error) 
 // /proc/sysrq-trigger is writable on the host. The probe output is returned alongside the error so
 // the caller can report it.
 func sysRqTriggerWritable(injectorPod *pod.Builder) (string, error) {
-	probeOut, probeErr := injectorPod.ExecCommand([]string{
+	probeOut, probeErr := injectorPod.ExecCommandWithTimeout([]string{
 		"nsenter", "-t", "1", "--pid", "--mount", "--", "sh", "-c",
 		"test -w /proc/sysrq-trigger",
-	})
+	}, sbrparams.SysRqExecTimeout)
 
 	return probeOut.String(), probeErr
 }
 
 // fireSysRqKernelPanic crashes the injector pod's host node through the SysRq trigger. The exec is
-// fire-and-forget: the node reboots immediately, so the command never returns cleanly.
+// fire-and-forget: the node dies mid-stream, so the command never returns cleanly and its error is
+// logged rather than asserted. It is still logged, because the command also enables SysRq
+// (echo 1 > /proc/sys/kernel/sysrq), which sysRqTriggerWritable does not cover; if that part fails
+// the node never panics and the only other symptom is a distant timeout waiting for the condition.
+// The timeout bounds the exec so a half-open stream to a dead node cannot hang the spec.
 func fireSysRqKernelPanic(injectorPod *pod.Builder) {
-	_, _ = injectorPod.ExecCommand([]string{
+	out, execErr := injectorPod.ExecCommandWithTimeout([]string{
 		"nsenter", "-t", "1", "--pid", "--mount", "--", "sh", "-c",
 		"echo 1 > /proc/sys/kernel/sysrq && echo c > /proc/sysrq-trigger",
-	})
+	}, sbrparams.SysRqExecTimeout)
+	if execErr != nil {
+		GinkgoWriter.Printf("SysRq panic exec on pod %s returned %v (expected: the node dies mid-exec); "+
+			"output: %s\n", injectorPod.Definition.Name, execErr, out.String())
+	}
 }
 
 // uncordonNodeIfNeeded clears the unschedulable flag on a node that is still cordoned. Failures are
@@ -1437,11 +1594,13 @@ func uncordonNodeIfNeeded(nodeName string) {
 // fencingProven returns nil once the victim's StorageBasedRemediation CR reports both
 // FencingSucceeded=True and Succeeded=True. The CR is looked up by node name on every call because it
 // can be deleted and recreated mid-remediation when the node's SBRStorageUnhealthy condition cycles to
-// Unknown; a transient NotFound is therefore just "keep waiting". The CR persists after the conditions
-// are set (NHC only deletes it once the node recovers), so there is no "proven then deleted" race to
-// special-case here. The CR as seen at the moment it was proven is returned, so callers can inspect
-// it without re-pulling a CR that NHC may delete once the node recovers. Intended as an Eventually
-// body.
+// Unknown; a transient NotFound is therefore just "keep waiting". The CR as seen at the moment it was
+// proven is returned, so callers can inspect it without re-pulling a CR that NHC may delete once the
+// node recovers. Intended as an Eventually body.
+//
+// This samples live state, so it can miss a remediation that completes and is deleted between two
+// polls. Specs that cannot tolerate that should start recordSBRCR before the disruption and assert
+// EverSaw(..., remediationFenced) on it instead.
 func fencingProven(nodeName string) (*unstructured.Unstructured, error) {
 	sbrCR, pullErr := pullSBRCR(nodeName)
 	if pullErr != nil {

@@ -399,8 +399,9 @@ a peer agent fences the node; and the reconciler proves death from storage, appl
 the node reboots and rejoins and NHC deletes the CR, the node is uncordoned and the taint is removed.
 
 The block-mode counterpart of the Filesystem node hang test (`node_hang.go`, OCP-88738), with its
-own ID. The CR is looked up by node name on every poll because it can be deleted and recreated
-when `SBRStorageUnhealthy` cycles to `Unknown`; `FencingInProgress` is deliberately not asserted
+own ID. The CR and the Node are recorded (list + watch) from before the panic, because NHC can
+delete the CR, and the reconciler the taint, as soon as `SBRStorageUnhealthy` cycles to `Unknown`;
+`FencingInProgress` is deliberately not asserted
 because the 60s fencing window and 60s staleness threshold make it flap.
 
 Full test case: [docs/TESTCASES/rhwa-1931.md](../../docs/TESTCASES/rhwa-1931.md)
@@ -501,7 +502,6 @@ Full test case: [docs/TESTCASES/rhwa-1965.md](../../docs/TESTCASES/rhwa-1965.md)
   mode; `hostPID` is still true; the DaemonSet schedules zero pods and is garbage-collected after
   the config is deleted
 
-
 ### 20. Verify Startup Clears the Unused Preflight Slot ([RHWA-1964](https://redhat.atlassian.net/browse/RHWA-1964))
 
 Regression coverage for RHWA-1058. Creates a filesystem SBRC, verifies the shared
@@ -519,3 +519,49 @@ Full test case: [docs/TESTCASES/rhwa-1964.md](../../docs/TESTCASES/rhwa-1964.md)
 - **Pass criteria**: Valid node map with ID 1 unused, full slot 1 zero through every
   agent for one minute, unchanged Ready pods and restart counts. Test SBRC and
   operands removed
+
+ 
+### 21. Verify Detect-Only Agents Stay Ready While Watchdog Is Held Open ([RHWA-1933](https://issues.redhat.com/browse/RHWA-1933))
+
+Validates the RHWA-1184 regression fix: with `detectOnlyMode: Enabled`, SBR agent pods start and
+remain Ready while a privileged keepalive pod holds `/dev/watchdog` open on every schedulable
+worker. The observation also checks agent pod identities and restart counts, keepalive processes,
+and that no worker reports `SBRStorageUnhealthy=True`. It runs unconditionally; no
+`SBR_TEST_RHWA1068` environment variable is required.
+
+Full test case: [docs/TESTCASES/rhwa-1933.md](../../docs/TESTCASES/rhwa-1933.md)
+
+- **Operators**: SBR v5.8.0, with the RHWA-1184 fix
+- **Cluster**: Multi-node, at least two schedulable workers
+- **Storage**: RWX StorageClass (CephFS auto-discovered or set with `SBR_STORAGE_CLASS`); skips when absent
+- **Environment**: Connected or disconnected. Non-destructive
+- **Standalone**: `ginkgo -v --label-filter="operator:sbr && tier:acceptance" --focus="RHWA-1184 regression" ./tests/sbr-operator/...`
+- **Pass criteria**: All agent pods stay Ready with the same UIDs and restart counts for 90 seconds; every keepalive remains running; no worker reports `SBRStorageUnhealthy=True`
+ 
+### 22. Verify SBR Manages the Agent DaemonSet NetworkPolicy ([RHWA-1970](https://issues.redhat.com/browse/RHWA-1970))
+
+Validates that the operator renders, owns, and reconciles the `sbr-agent-<sbrcName>`
+`NetworkPolicy` for the agent DaemonSet ([RHWA-1646](https://redhat.atlassian.net/browse/RHWA-1646)):
+automatic creation and controller ownership by its `StorageBasedRemediationConfig`, an ingress rule
+scoped to the two metrics ports (`8080`/`8082`) and restricted to namespaces labeled
+`metrics: enabled`, a deliberately unrestricted egress rule, recreation after manual deletion,
+restoration of a manually widened ingress rule, and the `MetricsNamespaceLabelMissing` warning
+event when `openshift-monitoring` lacks the required label. The test's SBRC uses a `nodeSelector`
+that matches no node, so the `NetworkPolicy` and DaemonSet render in full while scheduling zero
+agent pods.
+
+Full test case: [docs/TESTCASES/rhwa-1970.md](../../docs/TESTCASES/rhwa-1970.md)
+
+- **Operators**: SBR v5.8.0
+- **Cluster**: Any topology
+- **Storage**: Any RWX StorageClass; CephFS auto-discovered, `SBR_STORAGE_CLASS` overrides. Skips
+  when the cluster has none. No agent pod is scheduled
+- **Environment**: Connected or disconnected. **Non-destructive** — no node, running agent, or node
+  label is touched
+- **Standalone**: `ginkgo --label-filter="operator:sbr && tier:smoke" --focus="manages the agent DaemonSet NetworkPolicy" ./tests/sbr-operator/...`
+- **Pass criteria**: `NetworkPolicy` exists, owned by the SBRC, selecting only its agent pods;
+  ingress allows only the two metrics ports from namespaces labeled `metrics: enabled`; egress is
+  the single documented allow-all rule; a deleted `NetworkPolicy` is recreated and a manually
+  widened ingress rule is restored; the SBRC gets a `MetricsNamespaceLabelMissing` warning event
+  when `openshift-monitoring` lacks the label
+ 

@@ -743,8 +743,7 @@ func splitBrainHeartbeatProgress(observerPodName string, state splitBrainState) 
 // legitimately blip while the victim reboots, and the end state is asserted by witnessesUntouched.
 func witnessesStillHealthy(witnessNodes []string) error {
 	for _, witness := range witnessNodes {
-		if condErr := transientNodeHasCondition(witness,
-			sbrparams.SBRStorageUnhealthyCondition, false); condErr != nil {
+		if condErr := transientNodeHasCondition(witness, false); condErr != nil {
 			return condErr
 		}
 
