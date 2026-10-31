@@ -70,7 +70,8 @@ const (
 	NodeReadyTimeout = 10 * time.Minute
 
 	// NodeRebootTimeout is how long to wait for a node reboot to complete.
-	NodeRebootTimeout = 6 * time.Minute
+	// 10 minutes accommodates API client rate-limiter delays during active fencing.
+	NodeRebootTimeout = 10 * time.Minute
 
 	// OcDebugTimeout is the timeout for oc debug node commands.
 	OcDebugTimeout = 60 * time.Second

@@ -104,11 +104,14 @@ var snrcGVK = schema.GroupVersionKind{
 	Kind:    "SelfNodeRemediationConfig",
 }
 
-// snrcForPatch returns a minimal unstructured object suitable for client.Patch calls.
-func snrcForPatch(name string) *unstructured.Unstructured {
+// snrcForPatch returns a minimal unstructured object suitable for client.Patch
+// calls against the default SNRC. It takes no name: SNR's webhook rejects any
+// SelfNodeRemediationConfig not called snrparams.SNRConfigName, so there is
+// never another one to patch.
+func snrcForPatch() *unstructured.Unstructured {
 	obj := &unstructured.Unstructured{}
 	obj.SetGroupVersionKind(snrcGVK)
-	obj.SetName(name)
+	obj.SetName(snrparams.SNRConfigName)
 	obj.SetNamespace(medik8sparams.OperatorNs)
 
 	return obj
@@ -139,6 +142,47 @@ func verifyDSPodsRunning() error {
 			if !cs.Ready {
 				return fmt.Errorf("SNR DaemonSet pod %q container %q is not ready",
 					dsPod.Object.Name, cs.Name)
+			}
+		}
+	}
+
+	return nil
+}
+
+// verifyDSPodsNoHostPort checks that no SNR DaemonSet pod container sets hostPort.
+// Validates the fix for DAST KSV024 (AVD-KSV-0024): hostPorts should be
+// disallowed per the pod security standard 'Host Ports'.
+func verifyDSPodsNoHostPort() error {
+	dsListOptions := metav1.ListOptions{
+		LabelSelector: snrparams.DaemonSetPodLabelSelector,
+	}
+	dsPods, listErr := pod.List(APIClient, medik8sparams.OperatorNs, dsListOptions)
+	if listErr != nil {
+		return fmt.Errorf("failed to list SNR DaemonSet pods: %w", listErr)
+	}
+
+	if len(dsPods) == 0 {
+		return fmt.Errorf("no SNR DaemonSet pods found")
+	}
+
+	for _, dsPod := range dsPods {
+		for _, container := range dsPod.Object.Spec.Containers {
+			for _, port := range container.Ports {
+				if port.HostPort != 0 {
+					return fmt.Errorf(
+						"pod %q container %q port %q has hostPort=%d, expected 0",
+						dsPod.Object.Name, container.Name, port.Name, port.HostPort)
+				}
+			}
+		}
+
+		for _, initContainer := range dsPod.Object.Spec.InitContainers {
+			for _, port := range initContainer.Ports {
+				if port.HostPort != 0 {
+					return fmt.Errorf(
+						"pod %q init container %q port %q has hostPort=%d, expected 0",
+						dsPod.Object.Name, initContainer.Name, port.Name, port.HostPort)
+				}
 			}
 		}
 	}

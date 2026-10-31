@@ -8,6 +8,15 @@ import (
 )
 
 const (
+	// GhostPeerObservationDuration covers multiple five-second peer-monitor cycles.
+	GhostPeerObservationDuration = time.Minute
+
+	// GhostPeerReadTimeout bounds device execs and agent-state reads.
+	GhostPeerReadTimeout = 30 * time.Second
+
+	// GhostPeerCleanupTimeout bounds normal SBRC and operand removal.
+	GhostPeerCleanupTimeout = 6 * time.Minute
+
 	// DefaultPollInterval is the polling interval used with Eventually calls.
 	DefaultPollInterval = 5 * time.Second
 
@@ -232,6 +241,26 @@ const (
 	// NodeRebootPollInterval is the polling interval while waiting for a node to become NotReady then Ready.
 	NodeRebootPollInterval = 15 * time.Second
 
+	// WatchdogPostRebootDeviceWait is how long the watchdog integration check keeps retrying
+	// /dev/watchdog* on a node that rebooted after the inventory. A reboot clears the softdog
+	// kernel module, and only a restarted SBR agent loads it again, so the device files can be
+	// absent for a while after the node is already back Ready.
+	WatchdogPostRebootDeviceWait = 2 * time.Minute
+
+	// NodeHangPanicRebootDelaySeconds is the kernel.panic value set before the node-hang crash.
+	// The panicked kernel waits this long before rebooting, so the node stays NotReady well past
+	// the node-monitor grace period plus the 60s NHC unhealthy duration. With the RHCOS default,
+	// an AWS node is Ready again in under a minute and NHC never creates a remediation.
+	NodeHangPanicRebootDelaySeconds = 180
+
+	// NodeHangSyncSettleSeconds is how long the node-hang crash command waits after the
+	// emergency sync (sysrq-s) before triggering the panic, so dirty pages are flushed
+	// first and the crash does not corrupt CRI-O overlay links.
+	NodeHangSyncSettleSeconds = 2
+
+	// CrioCleanupTimeout bounds the oc debug call that removes the injector image from a rebooted node.
+	CrioCleanupTimeout = 2 * time.Minute
+
 	// SplitBrainHealthyNodeCheckDuration is how long to Consistently assert no SBR CR exists for healthy nodes.
 	SplitBrainHealthyNodeCheckDuration = 60 * time.Second
 
@@ -254,14 +283,15 @@ const (
 	SBRCDetectOnlyTestName = "test-sbrc-detect-only"
 
 	// WatchdogKeepaliveNamePrefix is the name prefix for privileged pods that hold /dev/watchdog
-	// open during the RHWA-1068 regression test.
+	// open during the RHWA-1184 regression test.
 	WatchdogKeepaliveNamePrefix = "sbr-wdog-keepalive-"
 
-	// WatchdogKeepaliveTimeout is how long to wait for all watchdog-keepalive pods to reach Running.
+	// WatchdogKeepaliveTimeout is how long to wait for a watchdog-keepalive pod to reach Running
+	// or to be deleted.
 	WatchdogKeepaliveTimeout = 2 * time.Minute
 
 	// DetectOnlyAllPodsReadyTimeout is how long to wait for ALL agent DaemonSet pods to reach Ready
-	// in the detect-only watchdog contention regression test (RHWA-1068).
+	// in the detect-only watchdog contention regression test (RHWA-1184).
 	DetectOnlyAllPodsReadyTimeout = 5 * time.Minute
 
 	// DetectOnlySuppressionCheckDuration is how long to Consistently assert no fencing occurs while
@@ -364,6 +394,11 @@ const (
 	// BlockFencingStateCheckTimeout is how long to wait for block device slot state to stabilize after reboot.
 	BlockFencingStateCheckTimeout = 5 * time.Minute
 
+	// BlockAgentReadyAfterRebootTimeout is how long to wait for a rebooted node's agent pod to become
+	// Ready. The pod cannot start until the node's Ceph RBD CSI driver registers and maps the shared
+	// volume again, which has been seen to take more than 6 minutes after a reboot on bare metal.
+	BlockAgentReadyAfterRebootTimeout = 10 * time.Minute
+
 	// BlockFencingStateCheckInterval is the polling interval for block device slot state checks.
 	BlockFencingStateCheckInterval = 10 * time.Second
 
@@ -390,6 +425,27 @@ const (
 	// OutOfServiceTaintKey is the taint the reconciler applies to a fenced node once death is proven
 	// (node.kubernetes.io/out-of-service=nodeshutdown:NoExecute), and removes again on CR deletion.
 	OutOfServiceTaintKey = "node.kubernetes.io/out-of-service"
+
+	// SBRCRResource is the plural resource name of StorageBasedRemediation, used to build the
+	// GroupVersionResource that the background watcher needs for a dynamic watch.
+	SBRCRResource = "storagebasedremediations"
+
+	// WatchRetryInterval is how long a background watch waits before re-listing after the API server
+	// closes the connection or rejects a stale resourceVersion.
+	WatchRetryInterval = 2 * time.Second
+
+	// WatchStartTimeout is how long a background watch keeps retrying its first list before the spec
+	// fails. The spec does not start its disruption until that list has succeeded.
+	WatchStartTimeout = 1 * time.Minute
+
+	// SysRqExecTimeout bounds the exec calls that probe and fire the SysRq trigger. The panic exec
+	// never returns cleanly, because the node dies mid-stream, so it must not block the spec forever.
+	SysRqExecTimeout = 30 * time.Second
+
+	// OutOfServiceTaintObservationTimeout is how long to wait for the watcher to report the
+	// out-of-service taint once fencing is proven. The reconciler applies the taint in the same
+	// reconcile that sets the conditions, so this only has to cover watch delivery lag.
+	OutOfServiceTaintObservationTimeout = 2 * time.Minute
 
 	// SBRCBlockTransientTestName is the SBRC name for the Ceph RBD transient network partition test.
 	SBRCBlockTransientTestName = "test-sbrc-block-transient"
@@ -514,12 +570,112 @@ const (
 	// taken moments after the baseline can legitimately show a slot that has not ticked yet.
 	BlockWitnessProgressTimeout = 2 * time.Minute
 
+	// SBRCBlockStorageLossTestName is the SBRC name for the Ceph RBD block-mode total storage I/O
+	// loss test (RHWA-1944).
+	SBRCBlockStorageLossTestName = "test-sbrc-block-storage-loss"
+
+	// NHCBlockStorageLossTestName is the NodeHealthCheck CR name for the block-mode total storage
+	// I/O loss test (RHWA-1944).
+	NHCBlockStorageLossTestName = "nhc-sbr-block-storage-loss"
+
+	// BlockStorageLossInjectorPodName is the privileged pod that blocks Ceph traffic in both
+	// directions on the victim node, with no time limit, so the victim cannot reach the shared
+	// device at all and only its watchdog can reboot it.
+	BlockStorageLossInjectorPodName = "sbr-rbd-storage-loss-injector"
+
 	// BlockInspectionMaxSkew bounds how old the newest heartbeat on the device may look from the
 	// machine running the test. It is deliberately loose: its job is to catch a device nobody is
 	// writing to any more, not to measure cadence, which BlockHeartbeatSlotMaxAge does on
 	// device-written timestamps alone and so without any dependency on the runner's clock.
 	BlockInspectionMaxSkew = 5 * time.Minute
+
+	// SBRCProbeShapeTestName is the SBRC name used by the agent DaemonSet probe contract test
+	// (RHWA-1965). Its nodeSelector matches no node, so it renders a DaemonSet without
+	// scheduling any agent pod.
+	SBRCProbeShapeTestName = "test-sbrc-probe-shape"
+
+	// AgentContainerName is the name of the agent container in the agent DaemonSet pod template.
+	AgentContainerName = "sbr-agent"
+
+	// AgentPreflightSentinelPath is the marker file the agent creates once its pre-flight storage
+	// write/read-back test passes. The readiness probe tests for it.
+	// Sourced from internal/agent/constants.go in the SBR operator.
+	AgentPreflightSentinelPath = "/var/run/sbr-agent/preflight-ok"
+
+	// AgentDefaultWatchdogPath is the watchdog character device the readiness probe checks outside
+	// detect-only mode. Block mode mounts the host /dev at /host-dev and resolves the device there.
+	AgentDefaultWatchdogPath = "/dev/watchdog"
+
+	// DetectOnlyModeEnabled is the spec.detectOnlyMode value that disables remediation.
+	DetectOnlyModeEnabled = "Enabled"
+
+	// AgentReadinessInitialDelaySeconds is the agent readiness probe's initialDelaySeconds. This
+	// and the four values below are asserted so a change to the probe's sensitivity cannot pass
+	// unnoticed alongside an unrelated edit.
+	AgentReadinessInitialDelaySeconds int32 = 60
+
+	// AgentReadinessPeriodSeconds is the agent readiness probe's periodSeconds.
+	AgentReadinessPeriodSeconds int32 = 10
+
+	// AgentReadinessTimeoutSeconds is the agent readiness probe's timeoutSeconds.
+	AgentReadinessTimeoutSeconds int32 = 5
+
+	// AgentReadinessFailureThreshold is the agent readiness probe's failureThreshold.
+	AgentReadinessFailureThreshold int32 = 6
+
+	// AgentReadinessSuccessThreshold is the agent readiness probe's successThreshold.
+	AgentReadinessSuccessThreshold int32 = 1
+
+	// NetworkPolicyNamePrefix is the naming prefix the SBRC controller uses for the agent
+	// NetworkPolicy. It is identical to SBRAgentDaemonSetPrefix: both render as
+	// "sbr-agent-<sbrcName>".
+	NetworkPolicyNamePrefix = SBRAgentDaemonSetPrefix
+
+	// AgentAppLabelValue is the "app" label value stamped on agent pods and read back into the
+	// NetworkPolicy's podSelector/peer selectors.
+	AgentAppLabelValue = "sbr-agent"
+
+	// RuntimeMetricsPort is the controller-runtime metrics port the agent NetworkPolicy allows
+	// ingress to, alongside AgentMetricsPort.
+	RuntimeMetricsPort = int32(8080)
+
+	// MetricsNamespaceSelectorLabelKey is the label key that scopes the agent NetworkPolicy's
+	// ingress rule on the metrics ports to namespaces carrying this label (e.g.
+	// openshift-monitoring).
+	MetricsNamespaceSelectorLabelKey = "metrics"
+
+	// MetricsNamespaceSelectorLabelValue is the label value paired with
+	// MetricsNamespaceSelectorLabelKey.
+	MetricsNamespaceSelectorLabelValue = "enabled"
+
+	// ExpectedOpenShiftMonitoringNamespace is the namespace the operator checks for the
+	// MetricsNamespaceSelectorLabelKey/Value label before warning that Prometheus will be cut off
+	// from the agent metrics ports.
+	ExpectedOpenShiftMonitoringNamespace = "openshift-monitoring"
+
+	// MetricsNamespaceLabelMissingEventReason is the Warning event reason the operator emits on
+	// the StorageBasedRemediationConfig when ExpectedOpenShiftMonitoringNamespace lacks the
+	// metrics label.
+	MetricsNamespaceLabelMissingEventReason = "MetricsNamespaceLabelMissing"
+
+	// NetworkPolicyManagedEventReason is the Normal event reason the operator emits when it
+	// creates or updates the agent NetworkPolicy.
+	NetworkPolicyManagedEventReason = "NetworkPolicyManaged"
+
+	// SBRCNetworkPolicyTestName is the SBRC name used by the agent NetworkPolicy test.
+	SBRCNetworkPolicyTestName = "test-sbrc-network-policy"
+
+	// NetworkPolicyRecreateTimeout bounds the wait for the operator to recreate the agent
+	// NetworkPolicy after it is deleted out-of-band, and for a drifted spec to be restored.
+	NetworkPolicyRecreateTimeout = 2 * time.Minute
 )
+
+// AgentProbeForbiddenSubstrings are the fragments of a host process-table scan that must never
+// appear in an agent probe command (RHWA-1955). The agent pod sets hostPID, so a probe such as
+// "grep -l sbr-agent /proc/*/cmdline" matches the probe's own sh and grep: it can never detect a
+// dead agent, and it exits 2 whenever any host process disappears mid-scan, which made kubelet
+// restart healthy agents on busy nodes.
+var AgentProbeForbiddenSubstrings = []string{"/proc", "grep", "cmdline"}
 
 // AgentExpectedMetricNames lists the Prometheus metric names that must be present in the agent output.
 // These are SBR operator contract and are used by the metrics test suite (OCP-89202).

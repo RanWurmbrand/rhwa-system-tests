@@ -244,6 +244,9 @@ var _ = Describe(
 
 			if targetNodeName != "" {
 				cleanupSBRCR(context.Background(), targetNodeName)
+
+				By("AfterAll: removing the injector image from the rebooted target node")
+				purgeInjectorImageAfterReboot(context.Background(), targetNodeName)
 			}
 		})
 
@@ -388,12 +391,7 @@ var _ = Describe(
 				// long before the node is Ready again, so FencingSucceeded must be observed now.
 
 				sbrObserver := &sbrCRObserver{nodeName: targetNodeName}
-				Eventually(sbrObserver.crFenced, sbrparams.NHCSBRCRCreationTimeout,
-					sbrparams.DefaultPollInterval).Should(Succeed(),
-					"NHC must create StorageBasedRemediation CR for node %q and it must reach FencingSucceeded=True",
-					targetNodeName)
-				GinkgoWriter.Printf("StorageBasedRemediation/%s (uid %s) created by NHC and FencingSucceeded=True\n",
-					targetNodeName, sbrObserver.uid)
+				waitForSBRCRFenced(sbrObserver)
 
 				By(fmt.Sprintf("Waiting for node %q to reboot (NotReady or boot ID change) "+
 					"after self-fencing via fence-message-read path", targetNodeName))

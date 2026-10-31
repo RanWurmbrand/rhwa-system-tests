@@ -242,6 +242,11 @@ var _ = Describe(
 					}
 				}
 			}
+
+			if targetNodeName != "" {
+				By("AfterAll: removing the injector image from the rebooted target node")
+				purgeInjectorImageAfterReboot(context.Background(), targetNodeName)
+			}
 		})
 
 		It("End-to-end: NHC detects storage failure and triggers SBR fencing",
@@ -276,11 +281,12 @@ var _ = Describe(
 
 				By("Recording pre-injection BootID (baseline before watchdog reboot)")
 
-				nodeBeforeInject, nodeBootErr := APIClient.CoreV1Interface.Nodes().Get(
-					context.TODO(), targetNodeName, metav1.GetOptions{})
-				Expect(nodeBootErr).ToNot(HaveOccurred(),
-					"Failed to get node %q to record pre-injection BootID", targetNodeName)
-				preRebootBootID = nodeBeforeInject.Status.NodeInfo.BootID
+				var preBootIDErr error
+
+				preRebootBootID, preBootIDErr = getNodeBootID(targetNodeName)
+				Expect(preBootIDErr).ToNot(HaveOccurred(),
+					"Failed to record pre-injection BootID on node %q", targetNodeName)
+				GinkgoWriter.Printf("Node %q pre-injection BootID: %s\n", targetNodeName, preRebootBootID)
 
 				By(fmt.Sprintf("Creating privileged injector pod on node %q", targetNodeName))
 
@@ -328,50 +334,51 @@ var _ = Describe(
 
 				GinkgoWriter.Printf("StorageBasedRemediation CR for node %q created by NHC\n", targetNodeName)
 
-				By("Waiting for FencingInProgress=True on the StorageBasedRemediation CR")
+				By("Waiting for the controller to start fencing (FencingInProgress or FencingSucceeded)")
 
+				// FencingInProgress=True can last less than one poll interval: the
+				// storage heartbeat already stopped because of the injected REJECT
+				// rules, so the controller proves the fence on its next reconcile
+				// and moves straight to FencingSucceeded. After the node reboots and
+				// recovers, NHC deletes the CR. Any of these states shows that
+				// fencing started; the BootID check below proves the reboot.
 				Eventually(func() error {
 					sbrObj, getErr := pullSBRCR(targetNodeName)
+					if k8serrors.IsNotFound(getErr) {
+						GinkgoWriter.Printf("StorageBasedRemediation/%s already removed after fencing\n", targetNodeName)
+
+						return nil
+					}
+
 					if getErr != nil {
 						return getErr
 					}
 
-					cond := getSBRCRCondition(sbrObj, sbrparams.FencingInProgressCondition)
-					if cond == nil {
-						return fmt.Errorf("StorageBasedRemediation/%s: %s condition not present",
-							targetNodeName, sbrparams.FencingInProgressCondition)
+					for _, condType := range []string{
+						sbrparams.FencingInProgressCondition, sbrparams.FencingSucceededCondition,
+					} {
+						if cond := getSBRCRCondition(sbrObj, condType); cond != nil &&
+							cond["status"] == string(corev1.ConditionTrue) {
+							GinkgoWriter.Printf("StorageBasedRemediation/%s: %s=True\n", targetNodeName, condType)
+
+							return nil
+						}
 					}
 
-					if cond["status"] != string(corev1.ConditionTrue) {
-						return fmt.Errorf("StorageBasedRemediation/%s: %s=%v, want True",
-							targetNodeName, sbrparams.FencingInProgressCondition, cond["status"])
-					}
-
-					return nil
+					return fmt.Errorf("StorageBasedRemediation/%s: neither %s nor %s is True",
+						targetNodeName, sbrparams.FencingInProgressCondition, sbrparams.FencingSucceededCondition)
 				}, medik8sparams.DefaultTimeout, sbrparams.DefaultPollInterval).Should(Succeed(),
-					"StorageBasedRemediation/%s must reach FencingInProgress=True", targetNodeName)
+					"StorageBasedRemediation/%s must start fencing", targetNodeName)
 
 				By(fmt.Sprintf("Waiting for node %q to go NotReady then return Ready (reboot cycle)", targetNodeName))
 
 				// Phase 1: wait for NotReady.
 				Eventually(func() error {
-					node, nodeGetErr := APIClient.CoreV1Interface.Nodes().Get(
-						context.TODO(), targetNodeName, metav1.GetOptions{})
-					if nodeGetErr != nil {
-						return nodeGetErr
-					}
-
-					for _, cond := range node.Status.Conditions {
-						if cond.Type == corev1.NodeReady && cond.Status != corev1.ConditionTrue {
-							return nil
-						}
-					}
-
-					return fmt.Errorf("node %s is still Ready; waiting for NotReady", targetNodeName)
+					return nodeRebootStarted(targetNodeName, preRebootBootID)
 				}, sbrparams.NodeRebootTimeout, sbrparams.NodeRebootPollInterval).Should(Succeed(),
 					"Node %q must become NotReady during reboot", targetNodeName)
 
-				GinkgoWriter.Printf("Node %q is NotReady — reboot in progress\n", targetNodeName)
+				GinkgoWriter.Printf("Node %q is NotReady or already rebooted\n", targetNodeName)
 
 				// Phase 2: wait for Ready.
 				Eventually(func() error {
@@ -399,11 +406,9 @@ var _ = Describe(
 
 				By("Verifying BootID changed (confirms actual reboot, not just transient state)")
 
-				nodeAfterReboot, nodeErr := APIClient.CoreV1Interface.Nodes().Get(
-					context.TODO(), targetNodeName, metav1.GetOptions{})
-				Expect(nodeErr).ToNot(HaveOccurred(),
-					"Failed to get node %q after reboot", targetNodeName)
-				newBootID := nodeAfterReboot.Status.NodeInfo.BootID
+				newBootID, newBootIDErr := getNodeBootID(targetNodeName)
+				Expect(newBootIDErr).ToNot(HaveOccurred(),
+					"Failed to read post-reboot BootID on node %q", targetNodeName)
 				Expect(newBootID).ToNot(Equal(preRebootBootID),
 					"Node %q BootID %q matches pre-reboot BootID %q — "+
 						"node did not actually reboot",
@@ -412,10 +417,11 @@ var _ = Describe(
 				By("Waiting for FencingSucceeded=True on the StorageBasedRemediation CR")
 
 				// Design note: IsNotFound is treated as success because the controller's normal
-				// cleanup flow sets FencingSucceeded=True then immediately deletes the CR.
-				// A poll that lands after deletion but before the next reconcile would otherwise
-				// return a false failure. The BootID assertion above already confirms an actual
-				// reboot occurred; this step confirms the controller acknowledged it.
+				// cleanup flow sets FencingSucceeded=True then immediately deletes the CR, so a
+				// poll that lands after deletion has no condition left to observe. Whether any
+				// poll sees the condition depends on poll timing against that short window.
+				// The BootID assertion above is the proof that the fence rebooted the node;
+				// this wait verifies the CR lifecycle finished, not that the condition was seen.
 				Eventually(func() error {
 					sbrObj, getErr := pullSBRCR(targetNodeName)
 					if k8serrors.IsNotFound(getErr) {
@@ -440,7 +446,8 @@ var _ = Describe(
 
 					return nil
 				}, medik8sparams.DefaultTimeout, sbrparams.DefaultPollInterval).Should(Succeed(),
-					"StorageBasedRemediation/%s must reach FencingSucceeded=True", targetNodeName)
+					"StorageBasedRemediation/%s must reach FencingSucceeded=True or be cleaned up after fencing",
+					targetNodeName)
 
 				By("Waiting for the SBR CR to be deleted (controller cleanup after successful fencing)")
 

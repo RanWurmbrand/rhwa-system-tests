@@ -246,6 +246,15 @@ func inspectFenceSlots(inspection *deviceInspection) {
 	inspection.fenceSlots = fenceSlots
 	GinkgoWriter.Printf("Fence region holds %d written slot(s)\n", len(fenceSlots))
 
+	By("Asserting no fence slot holds corrupt data")
+
+	for slotIdx, slot := range fenceSlots {
+		Expect(slot.Corrupt).To(BeFalse(),
+			"Fence slot %d holds data that is not a valid SBD fence message. A healthy slot is "+
+				"zero-filled or a valid message; corrupt contents must not be mistaken for empty",
+			slotIdx)
+	}
+
 	By("Asserting each fence slot is empty or carries reason NONE")
 
 	for _, entry := range inspection.nodeMapA.Entries {

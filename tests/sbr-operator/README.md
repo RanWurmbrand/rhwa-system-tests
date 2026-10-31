@@ -210,7 +210,7 @@ independently using a short-lived privileged hostPID pod per node.
 - **Storage**: None
 - **Environment**: Connected or disconnected
 - **Standalone**: `ginkgo --label-filter="sbr" --focus="Verify watchdog device" ./tests/sbr-operator/...`
-- **Pass criteria**: All hardware watchdog devices are character devices; nodes without hardware watchdog have softdog.ko present in the kernel module tree
+- **Pass criteria**: All hardware watchdog devices are character devices; nodes without hardware watchdog have softdog.ko present in the kernel module tree. A node that rebooted after the inventory retries the device check for 2 minutes; a softdog-backed device still missing afterwards is a post-reboot skip (a reboot clears the softdog module, and only a restarted SBR agent loads it again), not a failure. A hardware watchdog's device must survive reboots, so it keeps failing the check
 
 ### 9. Verify SBR Must-Gather Collects Diagnostic Data ([OCP-88733](https://polarion.engineering.redhat.com/polarion/#/project/OSE/workitem?id=OCP-88733))
 
@@ -399,8 +399,9 @@ a peer agent fences the node; and the reconciler proves death from storage, appl
 the node reboots and rejoins and NHC deletes the CR, the node is uncordoned and the taint is removed.
 
 The block-mode counterpart of the Filesystem node hang test (`node_hang.go`, OCP-88738), with its
-own ID. The CR is looked up by node name on every poll because it can be deleted and recreated
-when `SBRStorageUnhealthy` cycles to `Unknown`; `FencingInProgress` is deliberately not asserted
+own ID. The CR and the Node are recorded (list + watch) from before the panic, because NHC can
+delete the CR, and the reconciler the taint, as soon as `SBRStorageUnhealthy` cycles to `Unknown`;
+`FencingInProgress` is deliberately not asserted
 because the 60s fencing window and 60s staleness threshold make it flap.
 
 Full test case: [docs/TESTCASES/rhwa-1931.md](../../docs/TESTCASES/rhwa-1931.md)
@@ -463,3 +464,146 @@ Full test case: [docs/TESTCASES/rhwa-1934.md](../../docs/TESTCASES/rhwa-1934.md)
   Ready, schedulable, same boot-id, unchanged `sbr_self_fenced_total`; the victim returns Ready with a
   changed boot-id and a Ready agent pod, holds steady for 90s, then NHC deletes the CR and the node
   becomes schedulable with the taint gone
+
+### 19. Verify the SBR Agent DaemonSet Carries No Process-Table Probe ([RHWA-1965](https://redhat.atlassian.net/browse/RHWA-1965))
+
+Regression cover for [RHWA-1955](https://redhat.atlassian.net/browse/RHWA-1955). Proves the agent
+DaemonSet the controller renders carries no `livenessProbe` and no `startupProbe`,
+and that no probe on the agent container reads the host process table. The removed check,
+`grep -l sbr-agent /proc/*/cmdline`, was both blind and flaky: the agent pod sets `hostPID`, so the
+probe's own `sh` and `grep` carry the string `sbr-agent` and the grep matched itself, while any host
+process exiting mid-scan made it exit 2. On a busy node kubelet therefore restarted healthy agents —
+and a restart releases the watchdog, so an agent killed while its node is cut off from shared storage
+never comes back and nothing is left to reboot a node its peers have already fenced.
+
+The spec also pins the surviving readiness probe: command, the five tuning fields, and the
+detect-only variant that drops the watchdog check. It creates one config whose `nodeSelector` matches
+no node, so the DaemonSet renders the pod template in full while scheduling zero agent pods; the
+probe contract lives in that template, so no running agent is touched.
+
+Runtime behaviour is deliberately not asserted here. That a healthy agent survives process churn,
+that a dead agent still restarts (the agent is the container `ENTRYPOINT`), and that a
+storage-partitioned node still self-fences belong to the destructive specs and to the manual
+scenario on the bug.
+
+Full test case: [docs/TESTCASES/rhwa-1965.md](../../docs/TESTCASES/rhwa-1965.md)
+
+- **Operators**: SBR v0.3.0 (fix from storage-based-remediation PR #151)
+- **Cluster**: Any topology, any node count
+- **Storage**: Any RWX StorageClass; CephFS auto-discovered, `SBR_STORAGE_CLASS` overrides. Skips
+  when the cluster has none. No agent pod is scheduled
+- **Environment**: Connected or disconnected. **Non-destructive** — no node, no running agent and no
+  node label is touched
+- **Standalone**: `ginkgo --label-filter="sbr" --focus="no liveness or startup probe" ./tests/sbr-operator/...`
+- **Pass criteria**: `livenessProbe` and `startupProbe` are `nil` on the agent container in both
+  remediation and detect-only mode; no probe command contains `/proc`, `grep` or `cmdline`; the
+  readiness command is exactly `test -f /var/run/sbr-agent/preflight-ok && test -c /dev/watchdog`
+  with tuning `60/10/5/6/1`, and exactly `test -f /var/run/sbr-agent/preflight-ok` in detect-only
+  mode; `hostPID` is still true; the DaemonSet schedules zero pods and is garbage-collected after
+  the config is deleted
+
+### 20. Verify Startup Clears the Unused Preflight Slot ([RHWA-1964](https://redhat.atlassian.net/browse/RHWA-1964))
+
+Regression coverage for RHWA-1058. Creates a filesystem SBRC, verifies the shared
+node map assigns every real agent a unique ID other than 1, and reads slot 1
+through every agent for a minute. Skips if a real node owns ID 1.
+
+Full test case: [docs/TESTCASES/rhwa-1964.md](../../docs/TESTCASES/rhwa-1964.md)
+
+- **Operators**: SBR v5.8.0
+- **Cluster**: At least two Ready, schedulable workers. SNR agents must be stopped,
+  no unrelated SBRC may exist, and no NHC may reference an SBR template
+- **Storage**: RWX filesystem, CephFS auto-discovery or `SBR_STORAGE_CLASS`
+- **Environment**: Connected or disconnected. Non-destructive, no fault injection
+- **Standalone**: `ginkgo -v --label-filter='operator:sbr && tier:acceptance' --focus='startup clears the unassigned preflight slot' ./tests/sbr-operator`
+- **Pass criteria**: Valid node map with ID 1 unused, full slot 1 zero through every
+  agent for one minute, unchanged Ready pods and restart counts. Test SBRC and
+  operands removed
+
+ 
+### 21. Verify Detect-Only Agents Stay Ready While Watchdog Is Held Open ([RHWA-1933](https://issues.redhat.com/browse/RHWA-1933))
+
+Validates the RHWA-1184 regression fix: with `detectOnlyMode: Enabled`, SBR agent pods start and
+remain Ready while a privileged keepalive pod holds `/dev/watchdog` open on every schedulable
+worker. The observation also checks agent pod identities and restart counts, keepalive processes,
+and that no worker reports `SBRStorageUnhealthy=True`. It runs unconditionally; no
+`SBR_TEST_RHWA1068` environment variable is required.
+
+Full test case: [docs/TESTCASES/rhwa-1933.md](../../docs/TESTCASES/rhwa-1933.md)
+
+- **Operators**: SBR v5.8.0, with the RHWA-1184 fix
+- **Cluster**: Multi-node, at least two schedulable workers
+- **Storage**: RWX StorageClass (CephFS auto-discovered or set with `SBR_STORAGE_CLASS`); skips when absent
+- **Environment**: Connected or disconnected. Non-destructive
+- **Standalone**: `ginkgo -v --label-filter="operator:sbr && tier:acceptance" --focus="RHWA-1184 regression" ./tests/sbr-operator/...`
+- **Pass criteria**: All agent pods stay Ready with the same UIDs and restart counts for 90 seconds; every keepalive remains running; no worker reports `SBRStorageUnhealthy=True`
+ 
+### 22. Verify SBR Manages the Agent DaemonSet NetworkPolicy ([RHWA-1970](https://issues.redhat.com/browse/RHWA-1970))
+
+Validates that the operator renders, owns, and reconciles the `sbr-agent-<sbrcName>`
+`NetworkPolicy` for the agent DaemonSet ([RHWA-1646](https://redhat.atlassian.net/browse/RHWA-1646)):
+automatic creation and controller ownership by its `StorageBasedRemediationConfig`, an ingress rule
+scoped to the two metrics ports (`8080`/`8082`) and restricted to namespaces labeled
+`metrics: enabled`, a deliberately unrestricted egress rule, recreation after manual deletion,
+restoration of a manually widened ingress rule, and the `MetricsNamespaceLabelMissing` warning
+event when `openshift-monitoring` lacks the required label. The test's SBRC uses a `nodeSelector`
+that matches no node, so the `NetworkPolicy` and DaemonSet render in full while scheduling zero
+agent pods.
+
+Full test case: [docs/TESTCASES/rhwa-1970.md](../../docs/TESTCASES/rhwa-1970.md)
+
+- **Operators**: SBR v5.8.0
+- **Cluster**: Any topology
+- **Storage**: Any RWX StorageClass; CephFS auto-discovered, `SBR_STORAGE_CLASS` overrides. Skips
+  when the cluster has none. No agent pod is scheduled
+- **Environment**: Connected or disconnected. **Non-destructive** — no node, running agent, or node
+  label is touched
+- **Standalone**: `ginkgo --label-filter="operator:sbr && tier:smoke" --focus="manages the agent DaemonSet NetworkPolicy" ./tests/sbr-operator/...`
+- **Pass criteria**: `NetworkPolicy` exists, owned by the SBRC, selecting only its agent pods;
+  ingress allows only the two metrics ports from namespaces labeled `metrics: enabled`; egress is
+  the single documented allow-all rule; a deleted `NetworkPolicy` is recreated and a manually
+  widened ingress rule is restored; the SBRC gets a `MetricsNamespaceLabelMissing` warning event
+  when `openshift-monitoring` lacks the label
+ 
+
+### 23. Verify Total Storage I/O Loss Reboots a Ceph RBD Block-Mode Node via the Watchdog ([RHWA-1944](https://issues.redhat.com/browse/RHWA-1944))
+
+Proves the watchdog path in Block mode: a privileged injector pod blocks Ceph traffic on one victim
+worker in **both** directions (ports 3300, 6789, 6800–7300 on the OUTPUT and INPUT chains), with no
+time limit, so the victim can neither write its heartbeat nor read the fence message peers write into
+its own fence slot. The only mechanism left to reboot it is its watchdog — its agent sees a
+`StorageBasedRemediation` CR for its own node and stops petting.
+
+A peer sets `SBRStorageUnhealthy=True` (reason `HeartbeatTimeout`); NHC creates the CR; the
+reconciler proves death from storage, applies the `node.kubernetes.io/out-of-service` taint and sets
+`FencingSucceeded=True` / `Succeeded=True`; the victim's boot-id changes, it returns Ready with a
+Ready agent pod, holds that boot-id for 90s, and is uncordoned with the taint removed once NHC
+deletes the CR.
+
+The block-mode counterpart of the Filesystem total storage I/O loss test (`storage_loss_watchdog.go`,
+OCP-88880), with its own ID. The fencing proof is awaited **before** the reboot: death is proven from
+the already-stale heartbeat slot long before kubelet reports a new boot-id, and once the victim is
+back its iptables rules are gone with the reboot, so NHC deletes the CR and the taint goes with it.
+The CR and the Node are recorded from before the disruption, so the CR being recreated when
+`SBRStorageUnhealthy` cycles to `Unknown`, or the taint going with it, cannot be missed between polls;
+`FencingInProgress` is deliberately not asserted because the 60s fencing window
+and 60s staleness threshold make it flap.
+
+Full test case: [docs/TESTCASES/rhwa-1944.md](../../docs/TESTCASES/rhwa-1944.md)
+
+- **Operators**: SBR v5.8.0, NHC (skips when the NodeHealthCheck CRD is absent)
+- **Cluster**: Multi-node, at least one schedulable worker not hosting an SBR controller pod; skips
+  otherwise
+- **Storage**: ODF Ceph RBD StorageClass, RWX, `volumeMode: Block`. Auto-discovered by
+  provisioner (`rbd.csi.ceph.com`); `SBR_RBD_STORAGE_CLASS` overrides it. Skips when the
+  cluster has none
+- **Environment**: Connected or disconnected; `SBR_INJECTOR_IMAGE` must be mirrored when
+  disconnected. **Destructive** — one worker loses Ceph entirely and is rebooted by its watchdog.
+  Self Node Remediation must not be running. Skips when another `NodeHealthCheck` already remediates
+  through the SBR template, or when iptables is unusable in the victim's host namespaces
+- **Standalone**: `ginkgo --label-filter="sbr" --focus="the isolated Ceph RBD node is rebooted by its watchdog" ./tests/sbr-operator/...`
+- **Pass criteria**: victim reaches `SBRStorageUnhealthy=True` (reason `HeartbeatTimeout`); NHC
+  creates a `StorageBasedRemediation` CR for it; the CR reaches `FencingSucceeded=True` /
+  `Succeeded=True` and the victim carries the `out-of-service` taint; the victim's boot-id changes
+  (the watchdog rebooted it), it returns Ready with a Ready agent pod and holds that boot-id for 90s;
+  NHC deletes the CR and the node becomes schedulable with the taint gone
