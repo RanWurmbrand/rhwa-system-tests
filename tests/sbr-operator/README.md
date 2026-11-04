@@ -609,3 +609,124 @@ Full test case: [docs/TESTCASES/rhwa-2031.md](../../docs/TESTCASES/rhwa-2031.md)
   later than the victim's last heartbeat; the victim carries the `out-of-service` taint, reboots with
   a changed boot-id and returns Ready; after the CR is deleted it is schedulable with the taint gone
   and its agent pod is Ready again
+
+### 24. Verify SBRC Node Map Cleanup and Recreation (RHWA-1929)
+
+Creates a filesystem-mode SBRC, records the live node map, and verifies that its
+deletion runs a successful cleanup Job and clears the map on the original
+volume. It then recreates the same name and spec, requires the same PVC UID and
+PV name, and checks agent readiness, restart counts, and the recreated node map.
+
+Design: [test plan PR #63](https://github.com/openshift/rhwa-system-tests/pull/63).
+Test task: [RHWA-1929](https://redhat.atlassian.net/browse/RHWA-1929).
+Product fix: [SBR #69](https://github.com/medik8s/storage-based-remediation/pull/69).
+
+- **Operators**: SBR v5.8.0 already installed. This is not an operator-upgrade test.
+- **Cluster**: At least two Ready, schedulable workers. SNR agents must not be
+  running or scheduled. The SNR operator itself may remain installed. No NHC may
+  reference an SBR template, directly or through escalating remediation.
+- **Storage**: Existing RWX filesystem storage. `SBR_STORAGE_CLASS` selects it,
+  otherwise CephFS is auto-discovered. The test does not install ODF.
+- **Environment**: Connected or disconnected. For a disconnected cluster,
+  `SBR_INJECTOR_IMAGE` must provide `sh`, `sleep`, `dd`, and `base64` from a reachable
+  registry. It defaults to `registry.access.redhat.com/ubi9/ubi:latest`.
+- **Standalone**: `ginkgo -vv --label-filter="operator:sbr && tier:acceptance" --focus="SBRC deletion clears the node map" ./tests/sbr-operator`
+- **Pass criteria**: Exactly one spec with ID `1929` passes. The original map is
+  absent or empty after cleanup. The recreated agents become Ready within three minutes
+  with at most one restart, then keep their UIDs and restart counts for three
+  minutes. The recreated map contains only active agent nodes, and the SBRC reports Ready.
+  Test-owned resources are removed, including the retained PVC.
+
+#### Storage identity and cleanup
+
+The test deliberately retains its own PVC across SBRC deletion by adding the
+observer pod as a second, non-controller owner of that PVC. Normal garbage
+collection removes the old SBRC, agents and init Job without waiting for a
+test-only finalizer. The test never strips an operator finalizer.
+
+This is necessary because recreating against the same StorageClass does not
+guarantee reuse of the same data, and the controller changes the PV reclaim
+policy to `Delete`. The read-only observer mounts the original PVC before
+deletion and remains on it through verification. Both its PVC UID and PV name
+must remain unchanged on recreation.
+
+The observer uses SBR's existing agent service account and privileged SCC access
+to read the volume's SELinux-labeled files. It has no host mounts or API token.
+Both the PVC volume and container mount remain read-only. Cleanup explicitly
+removes the test's cleanup Jobs and their pods before deleting the PVC, so
+orphaned completed pods cannot leave that PVC stuck in Terminating.
+
+An empty node-map file is allowed because the agent's file-lock operation can
+recreate it during shutdown. Any nonempty map fails. The probe also requires
+the original heartbeat device to remain readable and nonempty, so an inaccessible
+or empty mount cannot produce a false pass.
+
+The implementation retains the original PVC until final cleanup, rather than
+waiting for its deletion as originally proposed in PR #63. This proves cleanup
+of the original map and healthy recreation on the same storage, not a guaranteed
+reproduction of the historical restart loop.
+
+The test removes only resources bearing its own marker or belonging to its
+uniquely named SBRC. It never uninstalls operators, disables SNR, or sweeps all
+cleanup Jobs in the namespace. A missing SNR/storage prerequisite is a skip,
+not evidence that the regression passed.
+
+Local invocation after prerequisites are satisfied:
+
+```bash
+export KUBECONFIG=/absolute/path/to/kubeconfig
+export ECO_TEST_FEATURES=sbr-operator
+export ECO_TEST_LABELS='operator:sbr && tier:acceptance'
+export ECO_TEST_FOCUS='SBRC deletion clears the node map'
+export ECO_TEST_VERBOSE=true
+export WORKLOAD_IMAGE=unused-by-sbr-node-map-cleanup
+export SBR_STORAGE_CLASS=ocs-external-storagecluster-cephfs
+export ECO_REPORTS_DUMP_DIR="$(mktemp -d)"
+make run-tests
+```
+
+Live validation passed on 2026-10-22 against SBR v5.8.0 with CephFS, including
+same-volume recreation, zero agent restarts during the stability window, and
+complete test cleanup. A before/after comparison still requires a pre-fix build.
+
+### 25. Verify Total Storage I/O Loss Reboots a Ceph RBD Block-Mode Node via the Watchdog ([RHWA-1944](https://issues.redhat.com/browse/RHWA-1944))
+
+Proves the watchdog path in Block mode: a privileged injector pod blocks Ceph traffic on one victim
+worker in **both** directions (ports 3300, 6789, 6800–7300 on the OUTPUT and INPUT chains), with no
+time limit, so the victim can neither write its heartbeat nor read the fence message peers write into
+its own fence slot. The only mechanism left to reboot it is its watchdog — its agent sees a
+`StorageBasedRemediation` CR for its own node and stops petting.
+
+A peer sets `SBRStorageUnhealthy=True` (reason `HeartbeatTimeout`); NHC creates the CR; the
+reconciler proves death from storage, applies the `node.kubernetes.io/out-of-service` taint and sets
+`FencingSucceeded=True` / `Succeeded=True`; the victim's boot-id changes, it returns Ready with a
+Ready agent pod, holds that boot-id for 90s, and is uncordoned with the taint removed once NHC
+deletes the CR.
+
+The block-mode counterpart of the Filesystem total storage I/O loss test (`storage_loss_watchdog.go`,
+OCP-88880), with its own ID. The fencing proof is awaited **before** the reboot: death is proven from
+the already-stale heartbeat slot long before kubelet reports a new boot-id, and once the victim is
+back its iptables rules are gone with the reboot, so NHC deletes the CR and the taint goes with it.
+The CR and the Node are recorded from before the disruption, so the CR being recreated when
+`SBRStorageUnhealthy` cycles to `Unknown`, or the taint going with it, cannot be missed between polls;
+`FencingInProgress` is deliberately not asserted because the 60s fencing window
+and 60s staleness threshold make it flap.
+
+Full test case: [docs/TESTCASES/rhwa-1944.md](../../docs/TESTCASES/rhwa-1944.md)
+
+- **Operators**: SBR v5.8.0, NHC (skips when the NodeHealthCheck CRD is absent)
+- **Cluster**: Multi-node, at least one schedulable worker not hosting an SBR controller pod; skips
+  otherwise
+- **Storage**: ODF Ceph RBD StorageClass, RWX, `volumeMode: Block`. Auto-discovered by
+  provisioner (`rbd.csi.ceph.com`); `SBR_RBD_STORAGE_CLASS` overrides it. Skips when the
+  cluster has none
+- **Environment**: Connected or disconnected; `SBR_INJECTOR_IMAGE` must be mirrored when
+  disconnected. **Destructive** — one worker loses Ceph entirely and is rebooted by its watchdog.
+  Self Node Remediation must not be running. Skips when another `NodeHealthCheck` already remediates
+  through the SBR template, or when iptables is unusable in the victim's host namespaces
+- **Standalone**: `ginkgo --label-filter="sbr" --focus="the isolated Ceph RBD node is rebooted by its watchdog" ./tests/sbr-operator/...`
+- **Pass criteria**: victim reaches `SBRStorageUnhealthy=True` (reason `HeartbeatTimeout`); NHC
+  creates a `StorageBasedRemediation` CR for it; the CR reaches `FencingSucceeded=True` /
+  `Succeeded=True` and the victim carries the `out-of-service` taint; the victim's boot-id changes
+  (the watchdog rebooted it), it returns Ready with a Ready agent pod and holds that boot-id for 90s;
+  NHC deletes the CR and the node becomes schedulable with the taint gone

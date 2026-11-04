@@ -17,6 +17,27 @@ const (
 	// GhostPeerCleanupTimeout bounds normal SBRC and operand removal.
 	GhostPeerCleanupTimeout = 6 * time.Minute
 
+	// SBRCNodeMapTestName is the prefix for the isolated filesystem node-map regression config.
+	SBRCNodeMapTestName = "test-sbrc-node-map"
+
+	// NodeMapTestLabel marks only resources created by the node-map regression test.
+	NodeMapTestLabel = "test.medik8s.io/node-map-cleanup"
+
+	// NodeMapCleanupTimeout outlasts the controller's four-minute cleanup-job wait.
+	NodeMapCleanupTimeout = 6 * time.Minute
+
+	// NodeMapExecTimeout bounds reads through the read-only PVC observer.
+	NodeMapExecTimeout = 30 * time.Second
+
+	// NodeMapRecreateReadyTimeout allows a warm restart without the old ten-minute convergence loop.
+	NodeMapRecreateReadyTimeout = 3 * time.Minute
+
+	// NodeMapConvergenceDuration exceeds the approximately 105-second stale-peer timeout.
+	NodeMapConvergenceDuration = 3 * time.Minute
+
+	// NodeMapMaxAgentRestarts is the startup restart budget before the stability observation.
+	NodeMapMaxAgentRestarts = 1
+
 	// DefaultPollInterval is the polling interval used with Eventually calls.
 	DefaultPollInterval = 5 * time.Second
 
@@ -108,6 +129,14 @@ const (
 	// SBRAgentDaemonSetPrefix is the naming prefix the SBRC controller uses for agent DaemonSets.
 	// DaemonSet name = SBRAgentDaemonSetPrefix + <sbrcName>.
 	SBRAgentDaemonSetPrefix = "sbr-agent-"
+
+	// SharedStoragePVCSuffix is appended to the SBRC name to form the shared-storage PVC the
+	// controller creates (PVC name = <sbrcName> + SharedStoragePVCSuffix).
+	SharedStoragePVCSuffix = "-shared-storage"
+
+	// SBRCConfigLabelKey is the label key the controller sets on agent DaemonSets, pods, Jobs,
+	// and the shared-storage PVC to tie them to their owning StorageBasedRemediationConfig.
+	SBRCConfigLabelKey = "sbrconfig"
 
 	// SBRCReadyTimeout is the time allowed for the SBRC's agent DaemonSet to have all scheduled
 	// pods reach Ready before a functional test begins. The first SBRC created in a suite pays a
@@ -569,6 +598,19 @@ const (
 	// the evidence is two reads with real time between them rather than a single comparison: one read
 	// taken moments after the baseline can legitimately show a slot that has not ticked yet.
 	BlockWitnessProgressTimeout = 2 * time.Minute
+
+	// SBRCBlockStorageLossTestName is the SBRC name for the Ceph RBD block-mode total storage I/O
+	// loss test (RHWA-1944).
+	SBRCBlockStorageLossTestName = "test-sbrc-block-storage-loss"
+
+	// NHCBlockStorageLossTestName is the NodeHealthCheck CR name for the block-mode total storage
+	// I/O loss test (RHWA-1944).
+	NHCBlockStorageLossTestName = "nhc-sbr-block-storage-loss"
+
+	// BlockStorageLossInjectorPodName is the privileged pod that blocks Ceph traffic in both
+	// directions on the victim node, with no time limit, so the victim cannot reach the shared
+	// device at all and only its watchdog can reboot it.
+	BlockStorageLossInjectorPodName = "sbr-rbd-storage-loss-injector"
 
 	// BlockInspectionMaxSkew bounds how old the newest heartbeat on the device may look from the
 	// machine running the test. It is deliberately loose: its job is to catch a device nobody is
