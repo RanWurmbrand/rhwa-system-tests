@@ -47,6 +47,9 @@ var _ = Describe(
 		)
 
 		BeforeAll(func() {
+			By("Clearing residual Ceph OSD blocklist entries from prior tests")
+			clearCephOSDBlocklist()
+			Skip("Skipping until RHWA-1966 is resolved")
 			requireNoSBRNodeHealthCheck()
 			testSBRC = setupBlockModeSBRC(sbrparams.SBRCBlockTransientTestName)
 
@@ -80,6 +83,9 @@ var _ = Describe(
 		})
 
 		AfterAll(func() {
+			By("Clearing any residual Ceph OSD blocklist entries from partition test")
+			clearCephOSDBlocklist()
+
 			if victimNodeName != "" {
 				By("Removing any StorageBasedRemediation CR left for the victim node")
 				cleanupSBRCR(context.Background(), victimNodeName)

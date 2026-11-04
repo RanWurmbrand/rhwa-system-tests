@@ -13,6 +13,7 @@ import (
 	"github.com/medik8s/system-tests/tests/internal/medik8sparams"
 	"github.com/medik8s/system-tests/tests/sbr-operator/internal/sbrparams"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
@@ -53,6 +54,8 @@ var _ = Describe(
 		)
 
 		BeforeAll(func() {
+			By("Clearing residual Ceph OSD blocklist entries from prior tests")
+			clearCephOSDBlocklist()
 			requireNoSBRNodeHealthCheck()
 
 			// The minimum sbrTimeoutSeconds (10) halves to a 5s heartbeat interval, the tightest
@@ -73,6 +76,9 @@ var _ = Describe(
 		})
 
 		AfterAll(func() {
+			By("Clearing any residual Ceph OSD blocklist entries from load test")
+			clearCephOSDBlocklist()
+
 			if testSBRC != nil {
 				By(fmt.Sprintf("Removing StorageBasedRemediationConfig %q", sbrparams.SBRCBlockLoadTestName))
 				deleteSBRCAndWait(testSBRC, sbrparams.SBRCBlockLoadTestName)
@@ -85,17 +91,18 @@ var _ = Describe(
 				labels.OperatorSBR,
 				labels.TierResiliency,
 				labels.ComponentDaemonSet,
-				labels.DisruptionNonDestructive,
+				labels.DisruptionDestructive,
 				labels.PlatformAny,
 				labels.FrequencyWeekly,
 			), func() {
 				baselines := captureAgentBaselines()
 				sequences := readBaselineSequences(observerPodName)
-				startCPULoad(baselines)
+				stressPodNames := startCPULoad(baselines)
 				assertNoAgentUnhealthyUnderLoad(baselines)
 				assertHeartbeatsAdvanced(observerPodName, sequences)
 				assertNothingRemediatedUnderLoad(baselines)
-				assertAgentCountersUnchanged(baselines)
+				waitForCPUStressCompletion(stressPodNames, baselines)
+				assertNoAgentSelfFencedUnderLoad(baselines)
 			})
 	})
 
@@ -169,7 +176,8 @@ func readBaselineSequences(observerPodName string) map[uint16]uint64 {
 }
 
 // startCPULoad saturates every agent node and registers the teardown that removes the load again.
-func startCPULoad(baselines []agentBaseline) {
+// It returns the stress pod names so the caller can wait for them to finish.
+func startCPULoad(baselines []agentBaseline) []string {
 	By("Starting a CPU stress pod on every node running an SBR agent")
 
 	stressPods := make([]*pod.Builder, 0, len(baselines))
@@ -196,6 +204,8 @@ func startCPULoad(baselines []agentBaseline) {
 		Expect(stressPod.WaitUntilRunning(medik8sparams.DefaultTimeout)).To(Succeed(),
 			"CPU stress pod %q must start on node %q", stressPodNames[idx], baselines[idx].nodeName)
 	}
+
+	return stressPodNames
 }
 
 // assertNoAgentUnhealthyUnderLoad is the heart of the test: under saturated CPUs, no agent may miss
@@ -206,8 +216,7 @@ func assertNoAgentUnhealthyUnderLoad(baselines []agentBaseline) {
 
 	Consistently(func() error {
 		for _, baseline := range baselines {
-			if condErr := transientNodeHasCondition(baseline.nodeName,
-				sbrparams.SBRStorageUnhealthyCondition, false); condErr != nil {
+			if condErr := transientNodeHasCondition(baseline.nodeName, false); condErr != nil {
 				return condErr
 			}
 		}
@@ -253,33 +262,68 @@ func assertNothingRemediatedUnderLoad(baselines []agentBaseline) {
 	}
 }
 
-// assertAgentCountersUnchanged closes the loop from the agents' own side: nobody self-fenced, and
-// no agent logged an I/O error against the shared device while its node was saturated.
-func assertAgentCountersUnchanged(baselines []agentBaseline) {
+// waitForCPUStressCompletion blocks until every CPU stress pod has finished. The post-stress metric
+// assertion reads agent metrics endpoints that may be transiently unavailable while the node's CPUs
+// are still saturated; waiting for the stress to end narrows that window.
+func waitForCPUStressCompletion(stressPodNames []string, baselines []agentBaseline) {
+	By("Waiting for CPU stress pods to finish before reading post-load metrics")
+
+	for idx, stressPodName := range stressPodNames {
+		phase, podLog := hostCommandPodOutcome(stressPodName, sbrparams.BlockLoadStressDuration)
+		GinkgoWriter.Printf("CPU stress pod %q on node %q finished with phase %s\n",
+			stressPodName, baselines[idx].nodeName, phase)
+		Expect(phase).To(Equal(corev1.PodSucceeded),
+			"CPU stress pod %q on node %q must succeed, got %s: %s",
+			stressPodName, baselines[idx].nodeName, phase, podLog)
+	}
+}
+
+// assertNoAgentSelfFencedUnderLoad closes the loop from the agents' own side: nobody self-fenced while
+// its node was saturated. The device I/O-error counter is logged, not asserted: it increments on
+// any transient failed read/write before the retry succeeds, so a single blip under saturation does
+// not mean a false storage-loss verdict. That thesis is carried by sbr_self_fenced_total and the
+// SBRStorageUnhealthy check instead.
+func assertNoAgentSelfFencedUnderLoad(baselines []agentBaseline) {
 	metricBodies := make(map[string]string, len(baselines))
 
 	By("Asserting each agent's sbr_self_fenced_total counter is unchanged")
 
-	for _, baseline := range baselines {
-		body, fetchErr := fetchAgentMetrics(baseline.agentPodName)
-		Expect(fetchErr).ToNot(HaveOccurred(),
-			"Must scrape the metrics of agent pod %q", baseline.agentPodName)
-		metricBodies[baseline.agentPodName] = body
-		selfFenced := agentCounter(body, baseline.agentPodName, sbrparams.SelfFencedMetricName)
-		Expect(selfFenced).To(Equal(baseline.selfFenced),
-			"Agent pod %q on node %q must not have self-fenced: %s went from %v to %v",
-			baseline.agentPodName, baseline.nodeName, sbrparams.SelfFencedMetricName,
-			baseline.selfFenced, selfFenced)
-	}
+	Eventually(func() error {
+		for _, baseline := range baselines {
+			body, fetchErr := fetchAgentMetrics(baseline.agentPodName)
+			if fetchErr != nil {
+				return fmt.Errorf("scrape metrics of agent pod %q: %w",
+					baseline.agentPodName, fetchErr)
+			}
 
-	By("Asserting each agent's sbr_device_io_errors_total counter is unchanged")
+			selfFenced, parseErr := sumPrometheusSamples(body, sbrparams.SelfFencedMetricName)
+			if parseErr != nil {
+				return fmt.Errorf("read %s from agent pod %q: %w",
+					sbrparams.SelfFencedMetricName, baseline.agentPodName, parseErr)
+			}
+
+			if selfFenced != baseline.selfFenced {
+				return StopTrying(fmt.Sprintf(
+					"agent pod %q on node %q self-fenced: %s went from %v to %v",
+					baseline.agentPodName, baseline.nodeName,
+					sbrparams.SelfFencedMetricName, baseline.selfFenced, selfFenced))
+			}
+
+			metricBodies[baseline.agentPodName] = body
+		}
+
+		return nil
+	}, 30*time.Second, sbrparams.DefaultPollInterval).Should(Succeed(),
+		"Every agent's %s must be readable and unchanged after CPU stress",
+		sbrparams.SelfFencedMetricName)
+
+	By("Logging each agent's sbr_device_io_errors_total delta under load")
 
 	for _, baseline := range baselines {
 		ioErrors := agentCounter(metricBodies[baseline.agentPodName], baseline.agentPodName,
 			sbrparams.DeviceIOErrorsMetricName)
-		Expect(ioErrors).To(Equal(baseline.ioErrors),
-			"Agent pod %q on node %q must not hit device I/O errors under CPU load: %s went from %v to %v",
+		GinkgoWriter.Printf("Agent pod %q on node %q: %s went from %v to %v under load (delta %v)\n",
 			baseline.agentPodName, baseline.nodeName, sbrparams.DeviceIOErrorsMetricName,
-			baseline.ioErrors, ioErrors)
+			baseline.ioErrors, ioErrors, ioErrors-baseline.ioErrors)
 	}
 }

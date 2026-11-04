@@ -90,6 +90,9 @@ var _ = Describe(
 			Expect(APIClient.Create(context.TODO(), testSBRC)).To(Succeed(),
 				"StorageBasedRemediationConfig %q must be created", sbrparams.SBRCBlockSplitBrainTestName)
 
+			By("Clearing residual Ceph OSD blocklist entries from prior tests")
+			clearCephOSDBlocklist()
+
 			By("Waiting for the Block device-init Job to succeed")
 			waitForBlockInitJobSucceeded(sbrparams.SBRCBlockSplitBrainTestName, testSBRC.GetUID())
 
@@ -141,6 +144,9 @@ var _ = Describe(
 				By("Flushing any leftover Ceph REJECT rule on the victim node")
 				flushCephRBDRules(victimNodeName)
 
+				By("Clearing residual Ceph OSD blocklist entries left by the fencing")
+				clearCephOSDBlocklist()
+
 				By("Uncordoning the victim node if it is still cordoned")
 				uncordonNodeIfNeeded(victimNodeName)
 
@@ -176,8 +182,7 @@ var _ = Describe(
 				By("Asserting SBRStorageUnhealthy is not True on the victim node")
 
 				// Absent, False or Unknown all pass; only True is a failed precondition.
-				Expect(transientNodeHasCondition(victimNodeName,
-					sbrparams.SBRStorageUnhealthyCondition, false)).To(Succeed(),
+				Expect(transientNodeHasCondition(victimNodeName, false)).To(Succeed(),
 					"Node %q must not report %s=True before its Ceph traffic is blocked",
 					victimNodeName, sbrparams.SBRStorageUnhealthyCondition)
 
@@ -305,7 +310,7 @@ var _ = Describe(
 
 				By("Asserting the FencingSucceeded transition happened after the victim's last heartbeat")
 
-				Expect(fencingProvenAfterHeartbeat(provenCR, state)).To(Succeed(),
+				Expect(fencingProvenAfterHeartbeat(provenCR, state.heartbeatTS)).To(Succeed(),
 					"FencingSucceeded for node %q must transition after its last heartbeat", victimNodeName)
 
 				By("Asserting the victim node carries the out-of-service taint")

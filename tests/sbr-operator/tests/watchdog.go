@@ -7,6 +7,7 @@ import (
 	"io"
 	"regexp"
 	"strings"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -26,6 +27,10 @@ import (
 
 var validWatchdogDevice = regexp.MustCompile(`^/dev/watchdog[0-9]*$`)
 
+// softdogDriverIdentity is the driver identity the kernel reports for devices backed by
+// the softdog module, as read from /sys/class/watchdog/watchdogN/identity.
+const softdogDriverIdentity = "softdog"
+
 var _ = Describe(
 	"SBR Functional — Watchdog Integration",
 	Ordered,
@@ -37,6 +42,17 @@ var _ = Describe(
 		// Only Ready, schedulable nodes are included.
 		var nodeWatchdogDevices map[string][]string
 
+		// inventoryBootIDs maps node name → boot ID recorded when that node's devices
+		// were inventoried. A node whose boot ID has changed since then was rebooted,
+		// which clears the softdog kernel module until an SBR agent restarts on it.
+		var inventoryBootIDs map[string]string
+
+		// inventoryDeviceIdentities maps node name to the driver identity the kernel
+		// reported for each inventoried device. The post-reboot missing-device skip
+		// applies only to softdog-backed devices: a hardware watchdog's driver loads
+		// at boot, so its device must be present after a reboot.
+		var inventoryDeviceIdentities map[string]map[string]string
+
 		BeforeAll(func() {
 			nodeList, err := APIClient.CoreV1Interface.Nodes().List(context.TODO(), metav1.ListOptions{})
 			Expect(err).ToNot(HaveOccurred(), "Failed to list cluster nodes for watchdog integration checks")
@@ -47,6 +63,8 @@ var _ = Describe(
 			// don't attempt to probe NotReady nodes and get misleading errors.
 			if WatchdogDevicesByNode != nil {
 				nodeWatchdogDevices = make(map[string][]string)
+				inventoryBootIDs = make(map[string]string)
+				inventoryDeviceIdentities = make(map[string]map[string]string)
 
 				for i := range nodeList.Items {
 					node := &nodeList.Items[i]
@@ -54,6 +72,14 @@ var _ = Describe(
 						GinkgoWriter.Printf("Skipping unschedulable/NotReady node %s\n", node.Name)
 
 						continue
+					}
+
+					if bootID, ok := WatchdogInventoryBootIDs[node.Name]; ok {
+						inventoryBootIDs[node.Name] = bootID
+					}
+
+					if identities, ok := WatchdogDeviceIdentitiesByNode[node.Name]; ok {
+						inventoryDeviceIdentities[node.Name] = identities
 					}
 
 					devs, ok := WatchdogDevicesByNode[node.Name]
@@ -84,6 +110,8 @@ var _ = Describe(
 			// Slow path: the inventory suite did not run (e.g. nightly label filter
 			// excludes FrequencyPresubmit). Discover watchdog devices independently.
 			nodeWatchdogDevices = make(map[string][]string)
+			inventoryBootIDs = make(map[string]string)
+			inventoryDeviceIdentities = make(map[string]map[string]string)
 
 			for i := range nodeList.Items {
 				node := &nodeList.Items[i]
@@ -95,6 +123,7 @@ var _ = Describe(
 					continue
 				}
 
+				inventoryBootIDs[nodeName] = node.Status.NodeInfo.BootID
 				podName := watchdogDebugPodName(nodeName)
 
 				// Run a pod to completion instead of exec-ing into a long-running one.
@@ -111,7 +140,7 @@ var _ = Describe(
 					WithPrivilegedFlag().
 					WithRestartPolicy(corev1.RestartPolicyNever).
 					RedefineDefaultCMD([]string{
-						"sh", "-c", "ls -1 /proc/1/root/dev/watchdog* 2>/dev/null || true",
+						"sh", "-c", watchdogInventoryCmd(),
 					}).
 					Create()
 				if createErr != nil {
@@ -161,28 +190,9 @@ var _ = Describe(
 
 				// Use a non-nil empty slice so that "no devices found" is
 				// distinguishable from "probe failed" (which leaves nil in the map).
-				devices := make([]string, 0)
-
-				for _, line := range strings.Split(strings.TrimSpace(logContent), "\n") {
-					line = strings.TrimSpace(line)
-					if line == "" {
-						continue
-					}
-
-					if !strings.HasPrefix(line, "/proc/1/root/dev/watchdog") {
-						GinkgoWriter.Printf("Warning: ignoring unexpected watchdog probe output on node %s: %q\n",
-							nodeName, line)
-
-						continue
-					}
-
-					device := strings.TrimPrefix(line, "/proc/1/root")
-					if device != "" && validWatchdogDevice.MatchString(device) {
-						devices = append(devices, device)
-					}
-				}
-
+				devices, identities := parseWatchdogInventory(logContent, nodeName)
 				nodeWatchdogDevices[nodeName] = devices
+				inventoryDeviceIdentities[nodeName] = identities
 			}
 
 			if len(nodeWatchdogDevices) == 0 {
@@ -250,16 +260,52 @@ var _ = Describe(
 						continue
 					}
 
+					// A node that rebooted after the inventory lost its softdog kernel module:
+					// a reboot unloads it, and only a restarted SBR agent loads it again. The
+					// device files can therefore be missing even though the node is Ready, so
+					// such nodes get a bounded retry instead of failing on the first miss.
+					// The missing-device skip below applies only to devices the inventory
+					// recorded as softdog-backed: a hardware watchdog's driver loads at boot,
+					// so its device must be present after a reboot and stays a failure.
+					rebootedSinceInventory := false
+					inventoryBootID := inventoryBootIDs[nodeName]
+					if inventoryBootID != "" {
+						node, nodeGetErr := APIClient.CoreV1Interface.Nodes().Get(
+							context.TODO(), nodeName, metav1.GetOptions{})
+						if nodeGetErr != nil {
+							errorMessages = append(errorMessages,
+								fmt.Sprintf("node %s: failed to get node for boot ID check: %v", nodeName, nodeGetErr))
+
+							continue
+						}
+
+						rebootedSinceInventory = node.Status.NodeInfo.BootID != inventoryBootID
+						if rebootedSinceInventory {
+							GinkgoWriter.Printf("Node %s rebooted after the watchdog inventory "+
+								"(boot ID %q -> %q); retrying device checks for %s\n",
+								nodeName, inventoryBootID, node.Status.NodeInfo.BootID,
+								sbrparams.WatchdogPostRebootDeviceWait)
+						}
+					}
+
 					podName := watchdogDebugPodName("hwchk-" + nodeName)
 
-					var testCmds []string
+					var testCmds, allDevicesPresentCmds []string
 					for _, device := range devices {
 						testCmds = append(testCmds,
 							fmt.Sprintf("test -c '/proc/1/root%s' && echo '%s OK' || echo '%s FAIL'",
 								device, device, device))
+						allDevicesPresentCmds = append(allDevicesPresentCmds,
+							fmt.Sprintf("test -c '/proc/1/root%s'", device))
 					}
 
-					hwCheckCmd := []string{"sh", "-c", strings.Join(testCmds, "; ")}
+					checkCmd := strings.Join(testCmds, "; ")
+					if rebootedSinceInventory {
+						checkCmd = retryingWatchdogCheckCmd(checkCmd, strings.Join(allDevicesPresentCmds, " && "),
+							sbrparams.WatchdogPostRebootDeviceWait)
+					}
+
+					hwCheckCmd := []string{"sh", "-c", checkCmd}
 					hwPod, createErr := pod.NewBuilder(
 						APIClient, podName, medik8sparams.OperatorNs, sbrparams.WatchdogDebugImage).
 						DefineOnNode(nodeName).
@@ -319,6 +365,17 @@ var _ = Describe(
 						case strings.HasSuffix(line, " FAIL"):
 							device := strings.TrimSuffix(line, " FAIL")
 							seenDevices[device] = true
+
+							if rebootedSinceInventory &&
+								inventoryDeviceIdentities[nodeName][device] == softdogDriverIdentity {
+								GinkgoWriter.Printf("Skipping softdog watchdog device %s on node %s: still not loaded %s "+
+									"after the node rebooted following the inventory; the softdog module is "+
+									"only loaded by an SBR agent restarting on the node\n",
+									device, nodeName, sbrparams.WatchdogPostRebootDeviceWait)
+
+								continue
+							}
+
 							errorMessages = append(errorMessages,
 								fmt.Sprintf("node %s: watchdog device %s is not a character device", nodeName, device))
 						default:
@@ -427,6 +484,25 @@ var _ = Describe(
 				}
 			})
 	})
+
+// retryingWatchdogCheckCmd wraps a watchdog check so a node that rebooted after the
+// inventory is retried for a bounded window before its devices are reported missing.
+// A reboot clears the softdog kernel module, and only a restarted SBR agent loads it
+// again, so /dev/watchdog* can be absent right after the node is back Ready. Both the
+// success exit and the window expiry run the reporting command, so the pod log always
+// carries one OK/FAIL line per device.
+func retryingWatchdogCheckCmd(reportCmd, allDevicesPresentCmd string, wait time.Duration) string {
+	attempts := int(wait / sbrparams.DefaultPollInterval)
+	if attempts < 1 {
+		attempts = 1
+	}
+
+	return fmt.Sprintf(
+		"attempt=0; while [ \"$attempt\" -lt %d ]; do "+
+			"if %s; then %s; exit 0; fi; attempt=$((attempt+1)); sleep %d; done; %s",
+		attempts, allDevicesPresentCmd, reportCmd,
+		int(sbrparams.DefaultPollInterval.Seconds()), reportCmd)
+}
 
 // watchdogProbeLogs reads the completed probe pod's logs.
 // When running inside a cluster pod (in-cluster config available), it uses the

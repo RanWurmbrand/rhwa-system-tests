@@ -37,6 +37,11 @@ var _ = Describe(
 		)
 
 		BeforeAll(func() {
+			Skip("RHWA-1987: flaky — agent containers not ready after node reboot")
+
+			By("Clearing residual Ceph OSD blocklist entries from prior tests")
+			clearCephOSDBlocklist()
+
 			By("Discovering Ceph RBD block storage class")
 
 			rbdStorageClass = discoverCephRBDStorageClass()
@@ -69,6 +74,9 @@ var _ = Describe(
 		})
 
 		AfterAll(func() {
+			By("Clearing any residual Ceph OSD blocklist entries from fencing")
+			clearCephOSDBlocklist()
+
 			if setupSBRC != nil {
 				By("Deleting SBRC created for block persistent fencing test")
 

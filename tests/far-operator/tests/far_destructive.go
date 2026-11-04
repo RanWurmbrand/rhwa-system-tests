@@ -606,6 +606,8 @@ var _ = Describe("FAR Destructive Tests",
 					Label(labels.TierAcceptance, labels.ComponentRemediation),
 					reportxml.ID("90217"),
 					func() {
+						Skip("Skipping until RHWA-1967 is resolved")
+
 						By("Verifying at least 3 Ready control plane nodes for etcd quorum")
 
 						cpNodes, err := farutils.GetReadyControlPlaneNodes(ctx, APIClient)

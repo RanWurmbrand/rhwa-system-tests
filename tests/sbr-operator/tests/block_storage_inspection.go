@@ -214,26 +214,15 @@ func inspectHeartbeatSlots(inspection *deviceInspection) {
 		time.Since(time.Unix(0, newest)))
 
 	for _, entry := range inspection.nodeMapA.Entries {
-		age := time.Duration(newest - byNodeID[entry.NodeID].Timestamp)
+		age, ageErr := heartbeatSlotLag(slots, entry.NodeID)
+		Expect(ageErr).ToNot(HaveOccurred(),
+			"Must measure how far node %q (node ID %d) is behind the newest heartbeat",
+			entry.NodeName, entry.NodeID)
 		Expect(age).To(BeNumerically("<", sbrparams.BlockHeartbeatSlotMaxAge),
 			"Node %q (node ID %d) last wrote %s before the newest heartbeat on the device; "+
 				"at the default cadence a slot must be no more than %s behind",
 			entry.NodeName, entry.NodeID, age, sbrparams.BlockHeartbeatSlotMaxAge)
 	}
-}
-
-// newestSlotTimestamp returns the highest timestamp written into any slot. Freshness is measured
-// against it rather than against the test runner's clock, which need not agree with the nodes'.
-func newestSlotTimestamp(slots []SlotData) int64 {
-	var newest int64
-
-	for _, slot := range slots {
-		if slot.Timestamp > newest {
-			newest = slot.Timestamp
-		}
-	}
-
-	return newest
 }
 
 // inspectFenceSlots proves nothing is asking for a node to be fenced on an idle cluster.
@@ -245,6 +234,15 @@ func inspectFenceSlots(inspection *deviceInspection) {
 		"Must read the fence region through agent pod %q", inspection.readerA)
 	inspection.fenceSlots = fenceSlots
 	GinkgoWriter.Printf("Fence region holds %d written slot(s)\n", len(fenceSlots))
+
+	By("Asserting no fence slot holds corrupt data")
+
+	for slotIdx, slot := range fenceSlots {
+		Expect(slot.Corrupt).To(BeFalse(),
+			"Fence slot %d holds data that is not a valid SBD fence message. A healthy slot is "+
+				"zero-filled or a valid message; corrupt contents must not be mistaken for empty",
+			slotIdx)
+	}
 
 	By("Asserting each fence slot is empty or carries reason NONE")
 

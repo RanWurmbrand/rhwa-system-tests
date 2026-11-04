@@ -164,6 +164,21 @@ container or pod level). Only checks the `manager` container.
 - **Standalone**: `ginkgo --label-filter="nhc" --focus="runs as non-root" ./tests/nhc-operator/...`
 - **Pass criteria**: Pod runAsNonRoot=true; expected manager container exists; manager container runAsUser != 0; allowPrivilegeEscalation=false; readOnlyRootFilesystem=true; capabilities.drop=[ALL]; seccomp profile RuntimeDefault
 
+### 5. Verify NHC Console Plugin Container Has readOnlyRootFilesystem Enabled ([RHWA-1943](https://issues.redhat.com/browse/RHWA-1943))
+
+Validates that the NHC console plugin pod (`node-remediation-console-plugin`)
+starts and remains Running with `readOnlyRootFilesystem: true` set in the container
+securityContext. Before RHWA-527, the pod entered CrashLoopBackOff because startup
+scripts wrote to the root filesystem. The test skips gracefully when the console
+plugin is not deployed (it is optional).
+
+- **Operators**: NHC v5.8.0+
+- **Cluster**: Any topology, OCP only (console plugin is OCP-specific)
+- **Storage**: none
+- **Environment**: Connected or disconnected
+- **Standalone**: `ginkgo --label-filter="operator:nhc && tier:smoke" --focus="readOnlyRootFilesystem" ./tests/nhc-operator/...`
+- **Pass criteria**: Console plugin pod Running; container `node-remediation-console-plugin` has `SecurityContext.ReadOnlyRootFilesystem=true`
+
 ## Non-Destructive Tests -- Negative Validation and Webhook Rejection
 
 Tests that verify NHC webhook rejection of invalid CRs and controller
@@ -526,3 +541,66 @@ values. Verifies the webhook rejects the update while remediation is active.
 - **Environment**: Connected or disconnected
 - **Standalone**: `ginkgo --label-filter="nhc && disruption:destructive" --focus="order change is rejected" ./tests/nhc-operator/...`
 - **Pass criteria**: TestRemediation CR created, update rejected with error containing "escalating remediations", node recovers after kubelet restart
+
+## Destructive Tests -- Must-Gather Collection
+
+Verifies that `oc adm must-gather` collects NHC diagnostic data while a
+remediation is actively in flight. The gather is deliberately run between the
+NHC CR entering `Remediating` and the remediation completing: the NHC CRD and
+operator-namespace artifacts are collected on an idle cluster too, so the
+ordering is what makes the result meaningful. NHC works with any operator that
+provides a remediation template CRD; this test uses SNR as the remediator.
+
+### Prerequisites (Must-Gather)
+
+- NHC and SNR operators installed **and running** (SNR is used as the remediator;
+  the test checks the SNR controller deployment is Ready, not just that its CRD exists)
+- At least 2 Ready worker nodes
+- SSH access to worker nodes, used to stop kubelet. The key is located via
+  `ECO_SSH_KEY_PATH`; setting `MEDIK8S_KUBELET_STOP_OCDEBUG` switches the stop
+  mechanism to `oc debug` instead
+- `oc` on `PATH`, and the must-gather image pullable from the cluster
+  (`MUST_GATHER_IMAGE` overrides the default)
+- `KUBECONFIG` set with cluster-admin access
+
+### 27. NHC Must-Gather Collection During Active Remediation ([OCP-51086](https://polarion.engineering.redhat.com/polarion/#/project/OSE/workitem?id=OCP-51086))
+
+Selects a worker node that hosts neither an SNR nor an NHC controller pod, stops its
+kubelet via SSH to trigger remediation, waits for the NHC CR to reach
+`Remediating` and the SNR CR to be created, then runs `oc adm must-gather` and
+validates the collected artifacts. Finally waits for the node to reboot and the
+NHC CR to return to `Enabled`.
+
+- **Operators**: NHC v0.12.0+, SNR
+- **Cluster**: Multi-node (2+ workers), SSH access to worker nodes
+- **Environment**: Connected. `MUST_GATHER_IMAGE` must point at a mirrored ref on a
+  disconnected cluster -- `mustgather.Run` also resolves the image digest with
+  `oc image info`, which warns (without failing) when the ref is unreachable
+- **Standalone**: `ginkgo --label-filter="nhc && disruption:destructive" --focus="collects NHC data via oc adm must-gather" ./tests/nhc-operator/...`
+- **Skipped when**: no SSH key is available, the SelfNodeRemediation CRD is absent, the
+  SNR controller deployment is not Ready, fewer than 2 worker nodes are Ready, or no
+  worker node is free of SNR/NHC controller pods. Each skip records a `skipped-reason`
+  report entry
+- **Pass criteria**: A worker node hosting neither an SNR nor an NHC controller pod is selected, NHC CRs whose selector matches the target node are cleared, kubelet stop succeeds, the NHC CR reaches `Enabled` before the break and `Remediating` after it, an SNR CR exists for the target node, at least one NHC controller pod is found, the resolved must-gather image contains a tag separator, `oc adm must-gather` exits successfully, and the output contains the target node's YAML, the operator namespace's aggregated `deployments.yaml`, the `nhc-test-must-gather` CR YAML, a SelfNodeRemediation CR collected during the active remediation, the NHC CRD definition and collected data for every NHC controller pod; the node then reboots (boot ID changes), the SNR CR is removed and the NHC CR returns to `Enabled`
+
+## Non-Destructive Tests -- Manual Health Confirmation
+
+### 28. Manual Health Confirmation After Delayed Recovery ([RHWA-1973](https://redhat.atlassian.net/browse/RHWA-1973))
+
+Regression coverage for RHWA-1846. Runs the installed NHC against a dedicated,
+harmless test remediator and a test-only condition on one Ready worker. Proves
+that `healthyDelay: -1s` retains the remediation after recovery, and manual
+confirmation lets the real controller delete the remediation, remove the
+annotation using its deployed RBAC, and return to Enabled.
+
+Full test case: [docs/TESTCASES/rhwa-1973.md](../../docs/TESTCASES/rhwa-1973.md)
+
+- **Operators**: NHC v5.8.0 with node-healthcheck-operator#465
+- **Cluster**: One Ready, schedulable worker, no competing NHC configurations
+- **Environment**: Connected or disconnected. Non-destructive, no fencing or
+  reboot. Requires test CRD/RBAC and Node status/metadata permissions
+- **Standalone**: `ginkgo -v --label-filter='operator:nhc && tier:acceptance' --focus='manual health confirmation after delayed recovery' ./tests/nhc-operator`
+- **Pass criteria**: Same remediation retained for 30 seconds after recovery,
+  then deleted after manual confirmation. Annotation removed by NHC, NHC Enabled
+  with one healthy node, worker UID and boot ID unchanged. Test resources and
+  Node fields restored

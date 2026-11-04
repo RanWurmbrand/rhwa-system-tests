@@ -28,6 +28,14 @@ var (
 	//   app.kubernetes.io/name=self-node-remediation, app.kubernetes.io/component=agent
 	DaemonSetPodLabelSelector = "app.kubernetes.io/name=self-node-remediation,app.kubernetes.io/component=agent"
 
+	// AgentPodSelectorMatchLabels is the map form of DaemonSetPodLabelSelector,
+	// matching the podSelector/peer selectors rendered into the
+	// self-node-remediation-ds-np NetworkPolicy.
+	AgentPodSelectorMatchLabels = map[string]string{
+		"app.kubernetes.io/name":      "self-node-remediation",
+		"app.kubernetes.io/component": "agent",
+	}
+
 	operatorNs = medik8sparams.OperatorNs
 
 	// ReporterNamespacesToDump tells the reporter from where to collect logs.
@@ -43,21 +51,6 @@ var (
 		{Cr: medik8sparams.NewUnstructuredList(CRDGroup, CRDVersion, "SelfNodeRemediationConfigList")},
 		{Cr: medik8sparams.NewUnstructuredList(CRDGroup, CRDVersion, "SelfNodeRemediationTemplateList")},
 		{Cr: &coordinationv1.LeaseList{}, Namespace: &operatorNs},
-	}
-
-	// RequiredAnnotations defines the required annotations and expected values for SNR CSV.
-	RequiredAnnotations = map[string]string{
-		"features.operators.openshift.io/tls-profiles":     "false",
-		"features.operators.openshift.io/disconnected":     "true",
-		"features.operators.openshift.io/fips-compliant":   "true",
-		"features.operators.openshift.io/proxy-aware":      "false",
-		"features.operators.openshift.io/cnf":              "false",
-		"features.operators.openshift.io/cni":              "false",
-		"features.operators.openshift.io/csi":              "false",
-		"features.operators.openshift.io/token-auth-aws":   "false",
-		"features.operators.openshift.io/token-auth-azure": "false",
-		"features.operators.openshift.io/token-auth-gcp":   "false",
-		"operatorframework.io/suggested-namespace":         medik8sparams.OperatorNs,
 	}
 
 	// SNRCRDNames lists the full CRD names (plural.group) for all SNR custom resource definitions.

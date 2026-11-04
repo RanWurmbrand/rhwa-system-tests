@@ -184,6 +184,13 @@ The SBR test suite is organized in the `/tests/sbr-operator/tests/` directory wi
 - Tests multi-instance SBRC support
 - Tests proper cleanup on deletion
 **Expected**: Complete lifecycle operations succeed
+
+The separate [node-map cleanup regression](../../tests/sbr-operator/tests/node_map_cleanup.go)
+(`RHWA-1929`, design [PR #63](https://github.com/openshift/rhwa-system-tests/pull/63))
+checks deletion of the original filesystem node map and same-name recreation on
+the same PVC. OCP-88734 does not make those storage-identity or restart-stability
+assertions. The slot-1 ghost-heartbeat issue, RHWA-1058, remains out of scope.
+
 **Storage Class**: 
 - **Auto-discovered RWX**: CephFS-based (searches for provisioner containing "cephfs")
 - **Override**: Set `SBR_STORAGE_CLASS` env var
@@ -296,6 +303,19 @@ The SBR test suite is organized in the `/tests/sbr-operator/tests/` directory wi
 - Leaves remediation CRs owned by other actors untouched, including when the absence preflight fails
 **Expected**: Storage failure is detected without remediation in detect-only mode, the mode toggle succeeds, and configuration deletion removes the agents
 **Storage Class**: 
+- **Auto-discovered RWX**: CephFS-based (searches for provisioner containing "cephfs")
+- **Override**: Set `SBR_STORAGE_CLASS` env var
+- **Requirement**: ReadWriteMany (RWX) access mode
+
+#### Test ID: 1933 - Detect-Only Startup With Watchdog Held Open (`detect_only.go`) 
+**Purpose**: Verify SBR agents remain Ready in detect-only mode while another process holds `/dev/watchdog` open
+**Description**:
+- Starts a privileged watchdog keepalive pod on every schedulable worker before creating the detect-only configuration
+- Verifies all agent pods stay Ready with the same pod identities and restart counts during a 90-second observation window
+- Verifies keepalive containers remain running and no worker reports `SBRStorageUnhealthy=True`
+- Does not assert specific preflight log messages
+**Expected**: Watchdog contention does not prevent agent startup or stability in detect-only mode
+**Storage Class**:
 - **Auto-discovered RWX**: CephFS-based (searches for provisioner containing "cephfs")
 - **Override**: Set `SBR_STORAGE_CLASS` env var
 - **Requirement**: ReadWriteMany (RWX) access mode

@@ -9,8 +9,9 @@ the candidate catalog, it verifies the same config identity/spec and the expecte
 controller and agent images. A unique toleration probe must reach newly rolled,
 Ready agent pods, then the original config is restored.
 
-Before and after upgrading, a test-owned `SelfNodeRemediation` must reboot a
-worker, preserve its node UID, and return it to Ready without remediation taints.
+Before upgrading, the GA agents must be Ready and reflect the customized config.
+After upgrading, a test-owned `SelfNodeRemediation` must reboot a worker, preserve
+its node UID, and return it to Ready without remediation taints.
 This is a destructive test for disposable OpenShift 5.0 clusters with at least
 two Ready workers and an eligible target not hosting the active controller.
 It does not need NHC, SSH, a kubelet-stop command, or storage provisioning.
@@ -46,6 +47,8 @@ and destructive remediation (kubelet stop, node reboot via NHC detection).
 - For destructive worker tests (15-17): NHC operator installed, 2+ worker nodes
 - For destructive master tests (18-19): NHC operator installed, 1+ worker nodes,
   3+ master nodes for etcd quorum safety
+- For the minPeersForRemediation test (20): 2+ Ready worker nodes; no NHC, SSH
+  or kubelet-stop command needed
 
 ## Running
 
@@ -73,13 +76,13 @@ make run-tests
 ### 1. Verify SNR Resources Are Installed and Running ([OCP-54205](https://polarion.engineering.redhat.com/polarion/#/project/OSE/workitem?id=OCP-54205))
 
 Validates that the SelfNodeRemediationConfig CR exists, DaemonSet pods
-are running, and controller-manager pods are in Running state.
+are running with no hostPort set (KSV024), and controller-manager pods are in Running state.
 
 - **Operators**: SNR v0.13.0+
 - **Cluster**: Any topology (MNO or SNO)
 - **Environment**: Connected or disconnected
 - **Standalone**: `ginkgo --label-filter="snr" --focus="resources are installed" ./tests/snr-operator/...`
-- **Pass criteria**: SNRC exists by name, at least one DS pod running, all controller pods running
+- **Pass criteria**: SNRC exists by name, at least one DS pod running, no DS pod container sets hostPort, all controller pods running
 
 ### 2. Verify Only Automatic Remediation Template Exists ([OCP-71010](https://polarion.engineering.redhat.com/polarion/#/project/OSE/workitem?id=OCP-71010))
 
@@ -237,13 +240,56 @@ and the Disabled condition disappears.
 - **Standalone**: `ginkgo --label-filter="snr" --focus="SNRC deletion disables" ./tests/snr-operator/...`
 - **Pass criteria**: DS pods deleted after SNRC removal; SNR CR shows Disabled/ConfigurationNotFound; after SNRC recreation DS pods return and Disabled condition is absent
 
+### 15. Verify preferredAddressTypes Is Validated and Causes No Remediation ([RHWA-1928](https://redhat.atlassian.net/browse/RHWA-1928))
+
+Validates `SelfNodeRemediationConfig.spec.preferredAddressTypes`, the field
+added by [self-node-remediation#331](https://github.com/medik8s/self-node-remediation/pull/331)
+to fix [RHWA-1596](https://redhat.atlassian.net/browse/RHWA-1596) (control plane
+self-diagnostics failing on clusters where node names are not DNS-resolvable,
+causing false self-remediation). Checks the installed CRD enum, rejects an
+undocumented value and accepts all six documented ones via server-side dry-run,
+probes the kubelet from the pod network, then sets the field and confirms the
+agents roll, render `PREFERRED_ADDRESS_TYPES=InternalIP,NodeName`, and leave the
+cluster un-remediated. Patches and restores the **default** SNRC, so it is
+`Serial`. **Labelled destructive**: the spec reboots nothing itself, but rolling the agent
+DaemonSet has driven control plane nodes into watchdog self-remediation on two unrelated
+clusters ([RHWA-1942](https://redhat.atlassian.net/browse/RHWA-1942)), so it is not safe
+for a non-destructive lane until that is fixed. Full specification: [docs/TESTCASES/rhwa-1928.md](../../docs/TESTCASES/rhwa-1928.md).
+
+- **Operators**: SNR v5.8.0+
+- **Cluster**: Any topology with at least one control plane node; every control plane node needs an InternalIP
+- **Environment**: Connected or disconnected. `WORKLOAD_IMAGE` must be a real image with `curl` — the kubelet probe pod runs from it
+- **Standalone**: `ginkgo --label-filter="operator:snr && tier:acceptance" --focus="preferredAddressTypes" ./tests/snr-operator/...`
+- **Pass criteria**: CRD enum matches the six documented values; invalid value rejected and all six accepted by dry-run; kubelet answers on each control plane InternalIP from the pod network; after the patch every agent pod is replaced and renders `InternalIP,NodeName`; no SelfNodeRemediation CR, no control plane node leaving Ready, and no boot ID change for 3 minutes; original SNRC spec restored
+- **Skips when**: a control plane node has no InternalIP, or a NodeHealthCheck selects control plane nodes (it could create a remediation during the observation window)
+
+### 16. Verify SNR DaemonSet Containers Set readOnlyRootFilesystem ([RHWA-1984](https://redhat.atlassian.net/browse/RHWA-1984))
+
+Verifies that every SNR DaemonSet agent pod container (and init container) sets
+`securityContext.readOnlyRootFilesystem=true`. Validates the fix for DAST
+finding KSV014 (AVD-KSV-0014) reported in
+[RHWA-470](https://redhat.atlassian.net/browse/RHWA-470). An immutable container root
+filesystem is a DAST hardening control (not a Pod Security Standards requirement); it
+stops a compromised container from writing to its own root filesystem, though not to
+separately mounted volumes. Full specification:
+[docs/TESTCASES/rhwa-1984.md](../../docs/TESTCASES/rhwa-1984.md).
+
+- **Operators**: SNR v5.8.0+
+- **Cluster**: Any topology with SNR installed via OLM
+- **Storage**: none
+- **Environment**: Connected or disconnected
+- **Standalone**: `ginkgo --label-filter="operator:snr && tier:smoke" --focus="readOnlyRootFilesystem" ./tests/snr-operator/...`
+- **Pass criteria**: Every SNR DaemonSet pod container and init container sets `securityContext.readOnlyRootFilesystem=true`
+
 ### Destructive Tests
 
 Tests that stop kubelet on nodes, triggering NHC-based health detection
 and SNR remediation with node reboots. Require NHC operator installed,
 2+ worker nodes, and 3+ master nodes. Run time: ~5-10 minutes per test.
+Test 20 is the exception: it injects a network fault inside an agent pod
+rather than touching a node, needs no NHC, and expects no reboot.
 
-### 15. Verify Worker Node Remediation After Kubelet Stop ([OCP-52416](https://polarion.engineering.redhat.com/polarion/#/project/OSE/workitem?id=OCP-52416))
+### 17. Verify Worker Node Remediation After Kubelet Stop ([OCP-52416](https://polarion.engineering.redhat.com/polarion/#/project/OSE/workitem?id=OCP-52416))
 
 Stops kubelet on a worker node, NHC detects the unhealthy node and
 creates an SNR CR, SNR remediates by rebooting the node, then verifies
@@ -256,7 +302,7 @@ was auto-selected (OCP 4.15+) via controller-manager logs.
 - **Standalone**: `ginkgo --label-filter="snr" --focus="worker node after kubelet stop" ./tests/snr-operator/...`
 - **Pass criteria**: Node rebooted (boot ID changed), creation timestamp unchanged (not deleted/recreated), OutOfServiceTaint auto-selected log message found
 
-### 16. Verify ResourceDeletion Strategy Evicts Workload Pod ([OCP-50772](https://polarion.engineering.redhat.com/polarion/#/project/OSE/workitem?id=OCP-50772))
+### 18. Verify ResourceDeletion Strategy Evicts Workload Pod ([OCP-50772](https://polarion.engineering.redhat.com/polarion/#/project/OSE/workitem?id=OCP-50772))
 
 Creates a ResourceDeletion SNRT, deploys a test workload pod on the
 target worker, stops kubelet, and verifies the pod is evicted from the
@@ -268,7 +314,7 @@ remediated node after SNR completes the remediation cycle.
 - **Standalone**: `ginkgo --label-filter="snr" --focus="ResourceDeletion" ./tests/snr-operator/...`
 - **Pass criteria**: Node rebooted, creation timestamp unchanged, workload pod evicted (deleted or moved off remediated node)
 
-### 17. Verify OutOfServiceTaint Strategy Evicts Workload Pod ([OCP-61594](https://polarion.engineering.redhat.com/polarion/#/project/OSE/workitem?id=OCP-61594))
+### 19. Verify OutOfServiceTaint Strategy Evicts Workload Pod ([OCP-61594](https://polarion.engineering.redhat.com/polarion/#/project/OSE/workitem?id=OCP-61594))
 
 Creates an OutOfServiceTaint SNRT, deploys a test workload pod on the
 target worker, stops kubelet, and verifies the pod is evicted from the
@@ -280,7 +326,7 @@ remediated node after SNR completes the remediation cycle.
 - **Standalone**: `ginkgo --label-filter="snr" --focus="OutOfServiceTaint" ./tests/snr-operator/...`
 - **Pass criteria**: Node rebooted, creation timestamp unchanged, workload pod evicted (deleted or moved off remediated node)
 
-### 18. Verify Master Node Remediation After Kubelet Stop ([OCP-55059](https://polarion.engineering.redhat.com/polarion/#/project/OSE/workitem?id=OCP-55059))
+### 20. Verify Master Node Remediation After Kubelet Stop ([OCP-55059](https://polarion.engineering.redhat.com/polarion/#/project/OSE/workitem?id=OCP-55059))
 
 Stops kubelet on a master/control-plane node, NHC detects the unhealthy
 node and creates an SNR CR, SNR remediates by rebooting the node, then
@@ -292,7 +338,7 @@ verifies the node recovers and was not deleted/recreated.
 - **Standalone**: `ginkgo --label-filter="snr" --focus="master node after kubelet stop" ./tests/snr-operator/...`
 - **Pass criteria**: Master rebooted (boot ID changed), creation timestamp unchanged (not deleted/recreated), node returns to Ready
 
-### 19. Verify Simultaneous Master and Worker Remediation ([OCP-56069](https://polarion.engineering.redhat.com/polarion/#/project/OSE/workitem?id=OCP-56069))
+### 21. Verify Simultaneous Master and Worker Remediation ([OCP-56069](https://polarion.engineering.redhat.com/polarion/#/project/OSE/workitem?id=OCP-56069))
 
 Stops kubelet on both a master and a worker node simultaneously, creates
 separate NHC CRs for each role, and verifies both nodes are remediated
@@ -303,3 +349,41 @@ concurrently -- both reboot and recover independently.
 - **Environment**: Connected or disconnected
 - **Standalone**: `ginkgo --label-filter="snr" --focus="simultaneously" ./tests/snr-operator/...`
 - **Pass criteria**: Both nodes rebooted (boot IDs changed), creation timestamps unchanged (not deleted/recreated), both recovered to Ready state
+
+### 20. Verify an Isolated SNR Agent Honours the Configured minPeersForRemediation ([RHWA-1972](https://redhat.atlassian.net/browse/RHWA-1972))
+
+Regression test for [RHWA-1872](https://redhat.atlassian.net/browse/RHWA-1872):
+the agent never read `MIN_PEERS_FOR_REMEDIATION` and used 0 regardless of
+`SelfNodeRemediationConfig.spec.minPeersForRemediation`. Two specs inject the
+same fault on two different workers -- the agent pod is cut off from the
+api-server cluster IPs *and* from every peer agent pod IP, inside its own
+network namespace -- and differ only in the configured minimum. With the
+minimum at 0 the isolated agent reboots its node; with the minimum at the Ready
+worker count, one more than any single worker can observe, it must leave the
+node alone. The first spec is the positive control that makes the second one
+mean something. No node, kubelet or host route is touched directly, and the
+routes are removed by the command that adds them.
+Test case: [docs/TESTCASES/rhwa-1972.md](../../docs/TESTCASES/rhwa-1972.md).
+
+- **Operators**: SNR 5.8.0+ (self-node-remediation PR #363)
+- **Cluster**: Multi-node with 2+ Ready workers (skips below that)
+- **Environment**: Connected or disconnected; no NHC, SSH or storage needed
+- **Destructive**: Reboots one worker node (two on a pre-fix build), waiting each back to Ready
+- **Watching it**: `watch -n 5 -d tools/watch/snr-watch.sh` shows node Ready/cordon/boot ID/taints, remediation CRs, the live `minPeersForRemediation` and the agent pods -- see [tools/watch](../../tools/watch/README.md)
+- **Standalone**: `ginkgo --label-filter="operator:snr && tier:resiliency" --focus="isolated agent" ./tests/snr-operator/...`
+- **Pass criteria**: Both agent pods carry `MIN_PEERS_FOR_REMEDIATION` equal to the configured value; the node isolated with minimum 0 reboots (new boot ID); the node isolated with the minimum out of reach keeps its boot ID and stays Ready for a minute past the isolation window; both nodes Ready, blackhole routes gone and the original `minPeersForRemediation` restored
+### 20. Verify SNR Manages the Agent DaemonSet NetworkPolicy ([RHWA-1645](https://redhat.atlassian.net/browse/RHWA-1645))
+
+Validates that the operator renders, owns, and reconciles the
+`self-node-remediation-ds-np` `NetworkPolicy` for the agent DaemonSet: automatic
+creation and ownership by the default `SelfNodeRemediationConfig`, the static
+ingress/egress rules (peer hostPort, DNS, HTTPS, own-node kubelet check),
+recreation after manual deletion, and correct/stable `ipBlock` egress rules
+derived from `EndpointHealthCheckUrl` across resolution, a simulated DNS flip,
+and rapid successive changes.
+
+- **Operators**: SNR v5.8.0
+- **Cluster**: Any topology
+- **Environment**: Connected or disconnected
+- **Standalone**: `ginkgo --label-filter="operator:snr && tier:smoke" --focus="manages the agent DaemonSet NetworkPolicy" ./tests/snr-operator/...`
+- **Pass criteria**: `NetworkPolicy` exists, owned by the config CR, with the expected static rules; recreated after deletion; `ipBlock` egress rule tracks `EndpointHealthCheckUrl` through resolution, a DNS flip, and rapid changes, converging to and holding a single rule with no allow-all fallback. See [docs/TESTCASES/rhwa-1645.md](../../docs/TESTCASES/rhwa-1645.md).

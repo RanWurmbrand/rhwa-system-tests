@@ -63,6 +63,59 @@ const (
 	// when it auto-detects the softdog watchdog path after an invalid path is configured.
 	SoftdogAutoDetectMessage = "auto detected softdog path"
 
+	// MinPeersEnvVarName is the agent environment variable the controller
+	// renders from spec.minPeersForRemediation of the SNRC.
+	MinPeersEnvVarName = "MIN_PEERS_FOR_REMEDIATION"
+
+	// MinPeersRemediateAlone is the minPeersForRemediation value that lets an
+	// agent remediate without any peer confirming the diagnosis. The reboot
+	// spec configures it so an isolated node reboots itself.
+	MinPeersRemediateAlone = 0
+
+	// MinWorkersForPeerCheck is the minimum number of Ready worker nodes the
+	// minPeersForRemediation specs need: one worker to isolate and reboot,
+	// a second to isolate without rebooting, and a peer for each of them --
+	// a node with an empty peer list takes the isolated-node branch whatever
+	// minPeersForRemediation says.
+	MinWorkersForPeerCheck = 2
+
+	// PeerListSettleTimeout is how long the agent pods must stay Running after
+	// a DaemonSet rollout before a fault is injected, so that every agent has
+	// a complete peer list and sees the peers that rolled after it.
+	//
+	// It is sized against the agent's *error* retry, not peerUpdateInterval:
+	// that defaults to 15m, far too long to wait out. An agent that lists its
+	// peers while a sibling pod is missing gets an error back from
+	// mapNodesToPrimaryPodIPs along with the short list, and errors put it on
+	// a quickPeerUpdateInterval loop of 2m until the list comes back clean.
+	// Waiting past that, rather than past peerUpdateInterval, is what makes
+	// the peer list trustworthy.
+	PeerListSettleTimeout = 3 * time.Minute
+
+	// IsolationHoldDuration is how long the api-server and peer agent
+	// addresses stay blackholed inside the agent pod when the node is not
+	// expected to reboot. It must exceed maxApiErrorThreshold *
+	// apiCheckInterval (3 * 15s by default) so the agent reaches the
+	// peer-check path.
+	IsolationHoldDuration = 2 * time.Minute
+
+	// IsolationRebootHoldDuration is the same window for the spec that does
+	// expect a reboot. It must outlast the agent reaching its verdict plus
+	// the watchdog timeout that follows, so the isolation is never lifted
+	// before the node goes down. The exec ends early anyway, when the reboot
+	// takes the agent pod with it.
+	IsolationRebootHoldDuration = 5 * time.Minute
+
+	// IsolationExecTimeout bounds the blocking exec that injects and then
+	// removes the blackhole routes. It must exceed every hold duration above.
+	IsolationExecTimeout = 8 * time.Minute
+
+	// RebootSettleWindow is how long the node that must not reboot is watched
+	// after its isolation window closes. The agent reaches its verdict partway
+	// into that window and a watchdog reboot lands some way after it, so a
+	// single reading at the end of the window could miss a late reboot.
+	RebootSettleWindow = 1 * time.Minute
+
 	// SNRReasonConfigNotFound is the status condition reason when SNRC is missing.
 	SNRReasonConfigNotFound = "ConfigurationNotFound"
 
@@ -126,7 +179,152 @@ const (
 	// MinReadyMasterNodes is the minimum number of Ready master nodes
 	// required for master remediation tests (etcd quorum safety).
 	MinReadyMasterNodes = 3
+
+	// --- preferredAddressTypes (RHWA-1928) constants ---.
+
+	// AgentDaemonSetName is the name of the SNR agent DaemonSet the
+	// SelfNodeRemediationConfig controller reconciles.
+	AgentDaemonSetName = "self-node-remediation-ds"
+
+	// AgentNetworkPolicyName is the NetworkPolicy the SNRC controller
+	// reconciles alongside the agent DaemonSet. Its egress allowance for
+	// KubeletSecurePort is what lets the control-plane self-diagnostics
+	// reach the kubelet at all.
+	AgentNetworkPolicyName = "self-node-remediation-ds-np"
+
+	// PreferredAddressTypesEnvVar is the agent container environment
+	// variable rendered from SelfNodeRemediationConfig.spec.preferredAddressTypes.
+	// An empty value means the agent falls back to ["NodeName"].
+	PreferredAddressTypesEnvVar = "PREFERRED_ADDRESS_TYPES"
+
+	// PreferredAddressTypesInvalid is a value outside the CRD enum, used to
+	// prove the API server rejects anything undocumented.
+	PreferredAddressTypesInvalid = "NotAnAddressType"
+
+	// KubeletSecurePort is the port the control-plane self-diagnostics probe.
+	// Named "secure" and not "read-only": 10250 is the kubelet's
+	// authenticated HTTPS port, 10255 is the read-only one. A string
+	// because it is passed to net.JoinHostPort.
+	KubeletSecurePort = "10250"
+
+	// KubeletDownMessage is the agent log line emitted when the
+	// self-diagnostics kubelet check fails for an address.
+	KubeletDownMessage = "kubelet service is down"
+
+	// KubeletProbeTimeout bounds the in-cluster curl probe of the kubelet
+	// port. Matches the 10s http.Client timeout the agent itself uses.
+	KubeletProbeTimeout = 10 * time.Second
+
+	// KubeletProbePodTimeout is how long to wait for a kubelet probe pod to
+	// be scheduled, pull its image and run to completion.
+	KubeletProbePodTimeout = 5 * time.Minute
+
+	// PreferredAddressNoRemediationDuration is the window over which no
+	// control-plane node may be remediated after the agent DaemonSet rolls.
+	//
+	// Four minutes, set from measurement rather than derivation. SNR's own
+	// timings suggest a false self-remediation should fire ~90s after the
+	// agents restart (maxApiErrorThreshold 3 x apiCheckInterval 15s = 45s to
+	// give up on the API, plus maxTimeForNoPeersResponse 30s). Reality is
+	// slower and more variable -- two observed reboots fired at 79s and 169s
+	// after the rollout completed, so the arithmetic understates it by up to
+	// 2x and two samples are not enough to claim a bound. 240s leaves ~200s
+	// for the node to go down after the ~40s node-monitor-grace-period
+	// detection cost, against an observed worst case of 169s.
+	//
+	// Do not shorten this on the strength of the arithmetic alone; a 3 minute
+	// window cleared the 169s event by 11 seconds, which was luck. Detection
+	// latency is what decides whether a reset is caught at all -- see the
+	// Ready check in noControlPlaneRemediation, and note that boot IDs lag the
+	// reset by ~3m40s and so cannot be the detector at any window length.
+	PreferredAddressNoRemediationDuration = 4 * time.Minute
+
+	// --- NetworkPolicy (RHWA-1645) constants ---.
+
+	// NetworkPolicyName is the name of the NetworkPolicy the operator
+	// renders and reconciles for the SNR agent DaemonSet pods.
+	NetworkPolicyName = "self-node-remediation-ds-np"
+
+	// NetworkPolicyLabelKey is the label key the operator stamps onto the
+	// rendered NetworkPolicy.
+	NetworkPolicyLabelKey = "k8s-app"
+	// NetworkPolicyLabelValue is the label value the operator stamps onto the
+	// rendered NetworkPolicy.
+	NetworkPolicyLabelValue = "self-node-remediation"
+
+	// NetworkPolicyStaticEgressRules is the number of static egress rules the
+	// NetworkPolicy always carries (peer, DNS, HTTPS, own-node kubelet).
+	NetworkPolicyStaticEgressRules = 4
+
+	// DefaultHostPort is the kubebuilder default for SelfNodeRemediationConfig.
+	DefaultHostPort = 30001
+
+	// NetworkPolicyDNSPort is the DNS port allowed in the NetworkPolicy's
+	// static DNS egress rule.
+	NetworkPolicyDNSPort = int32(53)
+
+	// NetworkPolicyDNSServicePort is the OVN-Kubernetes Service->pod DNAT
+	// target port also allowed in the static DNS egress rule.
+	NetworkPolicyDNSServicePort = int32(5353)
+
+	// NetworkPolicyHTTPSPort is the HTTPS port allowed in the NetworkPolicy's
+	// static HTTPS egress rule (reaching the Kubernetes API service).
+	NetworkPolicyHTTPSPort = int32(443)
+
+	// NetworkPolicyAPIServerPort is the Kubernetes API server port also
+	// allowed in the static HTTPS egress rule.
+	NetworkPolicyAPIServerPort = int32(6443)
+
+	// NetworkPolicyKubeletPort is the port allowed in the NetworkPolicy's
+	// static egress rule for the control-plane agent's own-node kubelet check.
+	NetworkPolicyKubeletPort = int32(10250)
+
+	// EndpointTestIPv4A is an RFC 5737 TEST-NET-3 literal used as a stand-in
+	// EndpointHealthCheckUrl. IP literals resolve immediately via net.LookupIP
+	// without an actual DNS lookup, keeping the test deterministic and
+	// network-independent while still exercising the real resolution path.
+	EndpointTestIPv4A = "203.0.113.5"
+
+	// EndpointTestIPv4ACIDR is the /32 CIDR the controller renders for
+	// EndpointTestIPv4A.
+	EndpointTestIPv4ACIDR = EndpointTestIPv4A + "/32"
+
+	// EndpointTestIPv4B is a second RFC 5737 TEST-NET-3 literal, used to
+	// simulate EndpointHealthCheckUrl resolving to a different address
+	// (a "DNS flip").
+	EndpointTestIPv4B = "203.0.113.6"
+
+	// EndpointTestIPv4BCIDR is the /32 CIDR the controller renders for
+	// EndpointTestIPv4B.
+	EndpointTestIPv4BCIDR = EndpointTestIPv4B + "/32"
+
+	// NetworkPolicyRaceIterations is the number of rapid, alternating
+	// EndpointHealthCheckUrl patches applied in the sole-writer stability
+	// (race) step.
+	NetworkPolicyRaceIterations = 6
+
+	// NetworkPolicyStabilityWindow is how long the NetworkPolicy's resolved
+	// ipBlock egress rule must remain unchanged after the rapid changes settle.
+	NetworkPolicyStabilityWindow = 30 * time.Second
 )
 
 // WorkloadTestImage is the container image used for test workload pods.
 var WorkloadTestImage = medik8sparams.WorkloadImage
+
+// PreferredAddressTypesValid is the enum the SelfNodeRemediationConfig CRD
+// must accept for spec.preferredAddressTypes, in the order the upstream
+// kubebuilder marker declares it.
+var PreferredAddressTypesValid = []string{
+	"NodeName",
+	"Hostname",
+	"InternalDNS",
+	"ExternalDNS",
+	"InternalIP",
+	"ExternalIP",
+}
+
+// PreferredAddressTypesConfigured is the list the test configures. InternalIP
+// first because that is the address type the fix exists to make usable;
+// NodeName second to prove the ordering survives rendering, since order is
+// the agent's fallback precedence.
+var PreferredAddressTypesConfigured = []string{"InternalIP", "NodeName"}

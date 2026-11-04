@@ -181,6 +181,9 @@ type FenceSlot struct {
 	WriterNodeID uint16
 	TargetNodeID uint16
 	Reason       uint8
+	// Corrupt is true when the slot holds data that is not a valid SBD fence message. Such a slot
+	// must not be mistaken for an empty (never-written) slot.
+	Corrupt bool
 }
 
 // readDeviceBlocksFromPod reads countBlocks blockSlotSize-sized blocks from the shared block
@@ -387,82 +390,62 @@ func validateSlotDataConsistency(slotDataByPod map[string][]SlotData) error {
 	return nil
 }
 
-// validateSequenceNumbers checks that sequence numbers are incrementing
-// correctly and there are no conflicts between different agents.
-func validateSequenceNumbers(slotDataByPod map[string][]SlotData) error {
-	// Collect all slots with sequence numbers across all pods
-	type sequenceEntry struct {
-		PodName  string
-		NodeID   uint16
-		Sequence uint64
-	}
-
-	var allSequences []sequenceEntry
-
-	for podName, slots := range slotDataByPod {
-		for _, slot := range slots {
-			if slot.HasData && slot.Sequence > 0 {
-				allSequences = append(allSequences, sequenceEntry{
-					PodName:  podName,
-					NodeID:   slot.NodeID,
-					Sequence: slot.Sequence,
-				})
-			}
-		}
-	}
-
-	if len(allSequences) == 0 {
-		GinkgoWriter.Printf("⚠ No sequence numbers found in slot data (agents may still be initializing)\n")
-
-		return nil
-	}
-
-	GinkgoWriter.Printf("Found %d slot entries with sequence numbers\n", len(allSequences))
-
-	// Group by NodeID and check sequence progression
+// validateSequenceNumbers proves that every expected node is still writing heartbeats: each one
+// appears on the device, and its sequence number moved between reads.
+//
+// reads holds one entry per round of reading the device, each round keyed by the agent pod the
+// slots were read through. Two rounds are needed, and that is the whole point of the parameter
+// being a slice: every pod in a single round reads the same slots at the same moment, so one
+// round yields identical sequence numbers for a node no matter how many pods it covers. Only a
+// second round, taken after the agents have had time to write again, can show a counter move.
+func validateSequenceNumbers(reads []map[string][]SlotData, expectedNodes int) error {
+	// Collect every sequence number seen for each node, across every round and every pod.
 	sequencesByNode := make(map[uint16][]uint64)
 
-	for _, entry := range allSequences {
-		sequencesByNode[entry.NodeID] = append(sequencesByNode[entry.NodeID], entry.Sequence)
+	for _, round := range reads {
+		for _, slots := range round {
+			for _, slot := range slots {
+				if slot.HasData && slot.Sequence > 0 {
+					sequencesByNode[slot.NodeID] = append(sequencesByNode[slot.NodeID], slot.Sequence)
+				}
+			}
+		}
 	}
 
-	GinkgoWriter.Printf("Detected %d unique node IDs writing heartbeats\n", len(sequencesByNode))
+	GinkgoWriter.Printf("Detected %d node IDs writing heartbeats over %d read(s)\n",
+		len(sequencesByNode), len(reads))
 
-	// For each node, sequences should be incrementing
+	// Every node the test expects must have written a heartbeat at all.
+	if len(sequencesByNode) < expectedNodes {
+		return fmt.Errorf("expected heartbeats from %d nodes, but found %d",
+			expectedNodes, len(sequencesByNode))
+	}
+
+	// And each of them must have advanced: the newest sequence seen for a node has to be higher
+	// than the oldest, which can only happen if it wrote again between the two rounds.
 	for nodeID, sequences := range sequencesByNode {
-		if len(sequences) == 0 {
-			continue
-		}
+		lowest, highest := sequences[0], sequences[0]
 
-		// Check that we have incrementing sequences (allowing for some reads to miss recent writes)
-		minSeq := sequences[0]
-		maxSeq := sequences[0]
-
-		for _, seq := range sequences {
-			if seq < minSeq {
-				minSeq = seq
+		for _, sequence := range sequences {
+			if sequence < lowest {
+				lowest = sequence
 			}
-			if seq > maxSeq {
-				maxSeq = seq
+
+			if sequence > highest {
+				highest = sequence
 			}
 		}
 
-		GinkgoWriter.Printf("  Node ID %d: sequence range [%d - %d], samples: %d\n",
-			nodeID, minSeq, maxSeq, len(sequences))
+		GinkgoWriter.Printf("  Node ID %d: sequence %d -> %d over %d sample(s)\n",
+			nodeID, lowest, highest, len(sequences))
 
-		// Sequences should be incrementing (max > min unless only 1 sample)
-		if len(sequences) > 1 && maxSeq <= minSeq {
-			return fmt.Errorf("sequences for node %d should be incrementing", nodeID)
+		if highest <= lowest {
+			return fmt.Errorf("node %d is not writing: its heartbeat sequence stayed at %d "+
+				"across %d sample(s)", nodeID, lowest, len(sequences))
 		}
 	}
 
-	// Verify we see heartbeats from multiple nodes (proves concurrent writes)
-	if len(sequencesByNode) < 2 {
-		return fmt.Errorf("expected heartbeats from at least 2 different nodes, but found %d",
-			len(sequencesByNode))
-	}
-	GinkgoWriter.Printf("✓ Sequence numbers are incrementing correctly\n")
-	GinkgoWriter.Printf("✓ Detected concurrent writes from %d different nodes\n", len(sequencesByNode))
+	GinkgoWriter.Printf("✓ All %d nodes advanced their heartbeat sequence\n", len(sequencesByNode))
 
 	return nil
 }
@@ -579,16 +562,19 @@ func ownedBy(owners []metav1.OwnerReference, ownerUID types.UID) bool {
 	return false
 }
 
-// deleteSBRCAndWait deletes an SBRC and blocks until it is gone. Deletion failures are logged
-// rather than asserted so teardown never masks the test result; the wait itself is asserted so
-// a stuck SBRC does not silently leak into the next suite.
+// deleteSBRCAndWait deletes an SBRC and blocks until the CR and its operands (agent DaemonSet,
+// pods, Jobs, shared-storage PVC) are gone. Deletion failures other than NotFound are logged
+// rather than asserted so teardown never masks the test result; the waits themselves are
+// asserted so a stuck SBRC or Terminating PVC cannot silently leak into the next recreate.
+//
+// NotFound on Delete is not an early return: a previous run may have removed the CR while leaving
+// the shared-storage PVC Terminating, and recreating the SBRC on top of that PVC is what wedges
+// device-init (RHWA-1184 BeforeAll flake).
 func deleteSBRCAndWait(sbrc *unstructured.Unstructured, sbrcName string) {
 	if deleteErr := APIClient.Delete(context.TODO(), sbrc); deleteErr != nil {
-		if k8serrors.IsNotFound(deleteErr) {
-			return
+		if !k8serrors.IsNotFound(deleteErr) {
+			GinkgoWriter.Printf("Warning: delete SBRC %s: %v\n", sbrcName, deleteErr)
 		}
-
-		GinkgoWriter.Printf("Warning: delete SBRC %s: %v\n", sbrcName, deleteErr)
 	}
 
 	Eventually(func() error {
@@ -607,6 +593,8 @@ func deleteSBRCAndWait(sbrc *unstructured.Unstructured, sbrcName string) {
 		return fmt.Errorf("SBRC %s still present", sbrcName)
 	}, medik8sparams.DefaultTimeout, sbrparams.DefaultPollInterval).Should(Succeed(),
 		"SBRC %q must be gone", sbrcName)
+
+	waitForSBRCOperandsGone(sbrcName)
 }
 
 // blockSuperblock is the parsed sector-0 header of a Block-mode SBR device. CRC and ComputedCRC
@@ -824,8 +812,10 @@ func readFenceSlotsFromPod(podName string) (map[int]FenceSlot, error) {
 	return parseFenceSlots(data), nil
 }
 
-// parseFenceSlots parses raw fence-region bytes. Like parseSlotData it skips anything without a
-// valid SBD header, and additionally skips messages that are not fence messages.
+// parseFenceSlots parses raw fence-region bytes. A zero-filled slot is a healthy, never-written
+// slot and is left out of the map. A slot that holds data but is not a valid SBD fence message
+// (bad magic, wrong message type, or a header checksum mismatch) is recorded with Corrupt set, so
+// the inspection can fail on it rather than mistake it for empty.
 func parseFenceSlots(data []byte) map[int]FenceSlot {
 	slots := make(map[int]FenceSlot)
 
@@ -833,6 +823,10 @@ func parseFenceSlots(data []byte) map[int]FenceSlot {
 		slotBytes := validSBDHeader(data, slotIdx, sbdFenceMsgType, sbdFenceMsgSize)
 
 		if slotBytes == nil {
+			if !slotRegionIsZero(data, slotIdx) {
+				slots[slotIdx] = FenceSlot{SlotIndex: slotIdx, Corrupt: true}
+			}
+
 			continue
 		}
 
@@ -845,4 +839,193 @@ func parseFenceSlots(data []byte) map[int]FenceSlot {
 	}
 
 	return slots
+}
+
+// highestNodeIDEntry returns the node name and node ID of the node map entry holding the highest
+// node ID. Block mode fills slot index nodeID-1, so that node owns the last slot in use in every
+// region and the slots after it are still zero-filled. That is what makes a write aimed one slot
+// too far visible: it lands on a slot nobody owns, rather than on another node's live data.
+func highestNodeIDEntry(nodeMap *blockNodeMap) (string, uint16, error) {
+	var (
+		highestName string
+		highestID   uint16
+	)
+
+	for nodeName, entry := range nodeMap.Entries {
+		if entry.NodeID > highestID {
+			highestName, highestID = nodeName, entry.NodeID
+		}
+	}
+
+	// Node IDs start at 1, so a zero here means no entry carried an assignment at all.
+	if highestID == 0 {
+		return "", 0, fmt.Errorf("the node map assigns no node ID (%d entries)", len(nodeMap.Entries))
+	}
+
+	return highestName, highestID, nil
+}
+
+// heartbeatSlotUnwritten returns nil when the heartbeat slot at slotIdx is zero-filled: a slot no
+// agent has ever written. Only that one 4 KB slot is read, not the whole region.
+//
+// An empty heartbeat slot is what makes a slot-offset defect dangerous rather than merely wrong: a
+// heartbeat header that fails to unmarshal counts as "stopped", so a completion check reading one
+// slot too far sees a zeroed slot and reports a live node dead.
+func heartbeatSlotUnwritten(observerPodName string, slotIdx int) error {
+	if slotIdx < 0 || slotIdx >= blockMaxNodes {
+		return fmt.Errorf("heartbeat slot index %d is outside the region (0-%d)",
+			slotIdx, blockMaxNodes-1)
+	}
+
+	data, readErr := readDeviceBlocksFromPod(observerPodName, heartbeatRegionBlock+slotIdx, 1)
+	if readErr != nil {
+		return readErr
+	}
+
+	if !slotRegionIsZero(data, 0) {
+		return fmt.Errorf("heartbeat slot index %d is not zero-filled: something has written to a "+
+			"slot no node owns", slotIdx)
+	}
+
+	return nil
+}
+
+// errFenceOnNeighbourSlot marks a fence message found in the slot after the victim's. That is the
+// signature of the reconciler/agent slot offset mismatch fixed upstream in 4131c812: the reconciler
+// wrote at nodeID*slotSize while the agent reads its own fence at (nodeID-1)*4096, so the fence
+// landed one slot past the victim and the completion check read a neighbour's heartbeat slot.
+// Callers match it to fail immediately rather than keep waiting for a fence that will never arrive.
+var errFenceOnNeighbourSlot = errors.New("the fence landed in the slot after the victim's")
+
+// fenceNeighbourhood is the fence slot a node ID owns together with the slot immediately after it,
+// read in a single pass so both describe the same moment on the device.
+type fenceNeighbourhood struct {
+	nodeID uint16
+	// slotIndex is where the node's own fence slot sits in the region: nodeID-1 in Block mode.
+	slotIndex int
+	// own is the node's own fence slot; ownWritten is false when the slot is zero-filled, which is
+	// what a slot no peer has ever fenced looks like.
+	own        FenceSlot
+	ownWritten bool
+	// next is the slot immediately after it. nextExists is false for node ID 255, which owns the
+	// last slot in the region, so there is no following slot to read.
+	next        FenceSlot
+	nextWritten bool
+	nextExists  bool
+}
+
+// readFenceNeighbourhood reads the fence slot the given node ID owns, and the one after it, through
+// an agent pod. Only those slots are read rather than the whole 1 MB region, so it is cheap enough
+// to poll.
+func readFenceNeighbourhood(observerPodName string, nodeID uint16) (fenceNeighbourhood, error) {
+	if nodeID < 1 || nodeID > blockMaxNodes {
+		return fenceNeighbourhood{}, fmt.Errorf("node ID %d is outside the Block-mode range 1-%d",
+			nodeID, blockMaxNodes)
+	}
+
+	hood := fenceNeighbourhood{nodeID: nodeID, slotIndex: int(nodeID) - 1}
+	hood.nextExists = hood.slotIndex+1 < blockMaxNodes
+	readBlocks := 1
+
+	if hood.nextExists {
+		readBlocks = 2
+	}
+
+	data, readErr := readDeviceBlocksFromPod(observerPodName, fenceRegionBlock+hood.slotIndex, readBlocks)
+	if readErr != nil {
+		return fenceNeighbourhood{}, readErr
+	}
+
+	// parseFenceSlots indexes the bytes it is handed, so slot 0 is the node's own slot and slot 1
+	// the one after it, whatever their absolute position in the region. The absolute indices are
+	// written back so failure messages name the slots as the device numbers them.
+	slots := parseFenceSlots(data)
+	hood.own, hood.ownWritten = slots[0]
+	hood.next, hood.nextWritten = slots[1]
+	hood.own.SlotIndex = hood.slotIndex
+	hood.next.SlotIndex = hood.slotIndex + 1
+
+	return hood, nil
+}
+
+// ownSlotQuiet returns nil when the node's own fence slot asks for nothing: either no peer has ever
+// written it, or it holds a FENCE_REASON_NONE message, which is what the agent's startup disarm
+// leaves behind. Data that is not a valid SBD fence message is an error rather than "empty".
+func (hood fenceNeighbourhood) ownSlotQuiet() error {
+	if !hood.ownWritten {
+		return nil
+	}
+
+	if hood.own.Corrupt {
+		return fmt.Errorf("fence slot index %d, owned by node ID %d, holds data that is not a valid "+
+			"SBD fence message", hood.slotIndex, hood.nodeID)
+	}
+
+	if hood.own.Reason != fenceReasonNone {
+		return fmt.Errorf("fence slot index %d, owned by node ID %d, already requests fencing "+
+			"(writer node ID %d, target node ID %d, reason %d)",
+			hood.slotIndex, hood.nodeID, hood.own.WriterNodeID, hood.own.TargetNodeID, hood.own.Reason)
+	}
+
+	return nil
+}
+
+// nextSlotEmpty returns nil while the slot after the node's own is still zero-filled, and an error
+// wrapping errFenceOnNeighbourSlot once it holds a fence message. A node that owns the last slot in
+// the region has no next slot, which satisfies this trivially.
+func (hood fenceNeighbourhood) nextSlotEmpty() error {
+	if !hood.nextExists || !hood.nextWritten {
+		return nil
+	}
+
+	if hood.next.Corrupt {
+		return fmt.Errorf("fence slot index %d, the one after node ID %d's and owned by no running "+
+			"node, holds data that is not a valid SBD fence message", hood.next.SlotIndex, hood.nodeID)
+	}
+
+	return fmt.Errorf("%w: fence slot index %d holds a fence message (writer node ID %d, target "+
+		"node ID %d, reason %d) while node ID %d reads its own fence at slot index %d",
+		errFenceOnNeighbourSlot, hood.next.SlotIndex, hood.next.WriterNodeID, hood.next.TargetNodeID,
+		hood.next.Reason, hood.nodeID, hood.slotIndex)
+}
+
+// fenceRequested returns the fence message in the node's own slot, and errors while that slot holds
+// nothing, holds unparseable data, or holds a disarmed FENCE_REASON_NONE message. Intended as an
+// Eventually body.
+func (hood fenceNeighbourhood) fenceRequested() (FenceSlot, error) {
+	if !hood.ownWritten {
+		return FenceSlot{}, fmt.Errorf("fence slot index %d, owned by node ID %d, is still empty",
+			hood.slotIndex, hood.nodeID)
+	}
+
+	if hood.own.Corrupt {
+		return FenceSlot{}, fmt.Errorf("fence slot index %d, owned by node ID %d, holds data that is "+
+			"not a valid SBD fence message", hood.slotIndex, hood.nodeID)
+	}
+
+	if hood.own.Reason == fenceReasonNone {
+		return FenceSlot{}, fmt.Errorf("fence slot index %d, owned by node ID %d, holds a "+
+			"FENCE_REASON_NONE message rather than a fence request", hood.slotIndex, hood.nodeID)
+	}
+
+	return hood.own, nil
+}
+
+// slotRegionIsZero reports whether the whole 4 KB slot at slotIdx is zero-filled, which is what a
+// healthy slot no agent has ever written looks like.
+func slotRegionIsZero(data []byte, slotIdx int) bool {
+	start := slotIdx * blockSlotSize
+	end := start + blockSlotSize
+
+	if end > len(data) {
+		end = len(data)
+	}
+
+	for _, b := range data[start:end] {
+		if b != 0 {
+			return false
+		}
+	}
+
+	return true
 }

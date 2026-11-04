@@ -128,6 +128,11 @@ var _ = Describe(
 				}, medik8sparams.DefaultTimeout, snrparams.DefaultPollInterval).Should(Succeed(),
 					"SNR DaemonSet pods are not all running and ready")
 
+				By("Verifying SNR DaemonSet pods do not set hostPort (KSV024)")
+
+				Expect(verifyDSPodsNoHostPort()).To(Succeed(),
+					"SNR DaemonSet pods should not expose hostPort per pod security standard")
+
 				By("Verifying SNR controller-manager pods are running")
 
 				ctrlListOptions := metav1.ListOptions{
@@ -140,6 +145,24 @@ var _ = Describe(
 					ctrlListOptions,
 				)
 				Expect(err).ToNot(HaveOccurred(), "SNR controller pods are not running")
+			})
+
+		It("RHWA-1984: Verify SNR DaemonSet containers set readOnlyRootFilesystem (KSV014)",
+			reportxml.ID("1984"),
+			Label(labels.TierSmoke, labels.DisruptionNonDestructive,
+				labels.PlatformAny, labels.FrequencyPresubmit,
+				labels.ComponentDaemonSet), func() {
+				By("Waiting for SNR DaemonSet pods to be running")
+
+				Eventually(verifyDSPodsRunning,
+					medik8sparams.DefaultTimeout, snrparams.DefaultPollInterval).Should(Succeed(),
+					"SNR DaemonSet pods are not all running and ready")
+
+				By("Verifying SNR DaemonSet containers set readOnlyRootFilesystem (KSV014)")
+
+				Expect(verifyDSPodsReadOnlyRootFilesystem()).To(Succeed(),
+					"SNR DaemonSet containers must set securityContext.readOnlyRootFilesystem=true "+
+						"per DAST finding KSV014 (AVD-KSV-0014)")
 			})
 
 		It("Verify only Automatic remediation template exists",
@@ -245,10 +268,12 @@ var _ = Describe(
 				} else {
 					annotations := snrCSV.Object.Annotations
 					Expect(annotations).ToNot(BeNil(), "CSV annotations should not be nil")
+					expectedAnnotations := medik8sparams.ExpectedFeatureAnnotations(
+						snrCSV.Object.Spec.Version.String(), false)
 
 					var annotationErrors []string
 
-					for annotationKey, expectedValue := range snrparams.RequiredAnnotations {
+					for annotationKey, expectedValue := range expectedAnnotations {
 						annotationValue, exists := annotations[annotationKey]
 						if !exists {
 							annotationErrors = append(annotationErrors,

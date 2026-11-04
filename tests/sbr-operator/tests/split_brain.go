@@ -250,6 +250,11 @@ var _ = Describe(
 
 				cleanupSBRCR(context.Background(), nodeName)
 			}
+
+			if targetNodeName != "" {
+				By("AfterAll: removing the injector image from the rebooted target node")
+				purgeInjectorImageAfterReboot(context.Background(), targetNodeName)
+			}
 		})
 
 		It("Split-brain: only the storage-isolated node is fenced; healthy witnesses are untouched",

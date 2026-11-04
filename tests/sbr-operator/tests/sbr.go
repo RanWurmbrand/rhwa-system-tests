@@ -35,6 +35,19 @@ import (
 // Populated by the "SBR Debug — Cluster Watchdog Inventory" suite; readable by subsequent tests.
 var WatchdogDevicesByNode map[string][]string
 
+// WatchdogInventoryBootIDs stores each node's boot ID recorded when the watchdog inventory
+// was taken. The watchdog integration test compares it with the current boot ID to detect
+// nodes that rebooted after the inventory: a reboot clears the softdog kernel module, so
+// /dev/watchdog* can be absent until an SBR agent restarts on the node.
+var WatchdogInventoryBootIDs map[string]string
+
+// WatchdogDeviceIdentitiesByNode stores, per node, the driver identity the kernel reported
+// for each inventoried watchdog device (e.g. "softdog", "iTCO_wdt"), read from
+// /sys/class/watchdog/watchdogN/identity while the device existed. The watchdog integration
+// test applies its post-reboot missing-device skip only to softdog-backed devices: a
+// hardware watchdog's driver loads at boot, so its device must survive reboots.
+var WatchdogDeviceIdentitiesByNode map[string]map[string]string
+
 // watchdogDebugPodName returns a valid pod name for the per-node watchdog discovery pod.
 func watchdogDebugPodName(nodeName string) string {
 	safe := strings.Map(func(r rune) rune {
@@ -55,6 +68,56 @@ func watchdogDebugPodName(nodeName string) string {
 	return name
 }
 
+// watchdogInventoryCmd lists every /dev/watchdog* device together with the driver identity
+// the kernel reports for it, one "<host-rooted path> <identity>" pair per line. The identity
+// comes from /sys/class/watchdog/watchdogN/identity (the kernel's sysfs watchdog ABI), and
+// /dev/watchdog is the misc device of the first watchdog (watchdog0), per the kernel
+// watchdog driver core API. Both are readable only while the device exists: once the
+// softdog module is unloaded after a reboot, the device and its sysfs entry are gone, which
+// is why the identity must be captured at inventory time.
+func watchdogInventoryCmd() string {
+	return `for d in /proc/1/root/dev/watchdog*; do
+	[ -e "$d" ] || continue
+	n=$(basename "$d"); [ "$n" = watchdog ] && n=watchdog0
+	printf '%s %s\n' "$d" "$(cat /proc/1/root/sys/class/watchdog/$n/identity 2>/dev/null)"
+done`
+}
+
+// parseWatchdogInventory splits watchdogInventoryCmd output into the device paths (with the
+// /proc/1/root host-root prefix trimmed) and the driver identity reported for each device.
+// Lines that are not watchdog device paths are ignored with a warning. The identity is
+// empty when the kernel did not report one.
+func parseWatchdogInventory(output, nodeName string) ([]string, map[string]string) {
+	devices := make([]string, 0)
+	identities := make(map[string]string)
+
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		path, identity, _ := strings.Cut(line, " ")
+
+		if !strings.HasPrefix(path, "/proc/1/root/dev/watchdog") {
+			GinkgoWriter.Printf("Warning: ignoring unexpected watchdog probe output on node %s: %q\n",
+				nodeName, line)
+
+			continue
+		}
+
+		device := strings.TrimPrefix(path, "/proc/1/root")
+		if device == "" || !validWatchdogDevice.MatchString(device) {
+			continue
+		}
+
+		devices = append(devices, device)
+		identities[device] = strings.TrimSpace(identity)
+	}
+
+	return devices, identities
+}
+
 var _ = Describe(
 	"SBR Debug — Cluster Watchdog Inventory",
 	Ordered,
@@ -69,6 +132,8 @@ var _ = Describe(
 				labels.FrequencyPresubmit,
 			), func() {
 				WatchdogDevicesByNode = make(map[string][]string)
+				WatchdogInventoryBootIDs = make(map[string]string)
+				WatchdogDeviceIdentitiesByNode = make(map[string]map[string]string)
 				nodeList, err := APIClient.CoreV1Interface.Nodes().List(context.TODO(), metav1.ListOptions{})
 				Expect(err).ToNot(HaveOccurred(), "Failed to list cluster nodes for watchdog inventory")
 
@@ -76,6 +141,7 @@ var _ = Describe(
 
 				for i := range nodeList.Items {
 					nodeName := nodeList.Items[i].Name
+					WatchdogInventoryBootIDs[nodeName] = nodeList.Items[i].Status.NodeInfo.BootID
 					podName := watchdogDebugPodName(nodeName)
 
 					By(fmt.Sprintf("Creating watchdog discovery pod on node %s", nodeName))
@@ -106,7 +172,7 @@ var _ = Describe(
 
 					// /proc/1/root is the host's root filesystem inside a hostPID+privileged container.
 					buf, execErr := debugPod.ExecCommand(
-						[]string{"sh", "-c", "ls -1 /proc/1/root/dev/watchdog* 2>/dev/null || true"})
+						[]string{"sh", "-c", watchdogInventoryCmd()})
 
 					if _, delErr := debugPod.Delete(); delErr != nil {
 						GinkgoWriter.Printf("Warning: failed to delete watchdog debug pod for node %s: %v\n",
@@ -116,6 +182,7 @@ var _ = Describe(
 					if execErr != nil {
 						GinkgoWriter.Printf("Warning: exec failed on node %s: %v\n", nodeName, execErr)
 						WatchdogDevicesByNode[nodeName] = nil
+						WatchdogDeviceIdentitiesByNode[nodeName] = nil
 
 						continue
 					}
@@ -123,15 +190,9 @@ var _ = Describe(
 					// Use a non-nil empty slice so that "no devices found" is distinguishable
 					// from "probe failed" (nil) — the watchdog integration test fast path
 					// relies on this three-state contract.
-					devices := make([]string, 0)
-
-					for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
-						for _, token := range strings.Fields(line) {
-							devices = append(devices, strings.TrimPrefix(token, "/proc/1/root"))
-						}
-					}
-
+					devices, identities := parseWatchdogInventory(buf.String(), nodeName)
 					WatchdogDevicesByNode[nodeName] = devices
+					WatchdogDeviceIdentitiesByNode[nodeName] = identities
 				}
 
 				GinkgoWriter.Println("=== /dev/watchdog* Inventory ===")
@@ -285,9 +346,14 @@ var _ = Describe(
 
 				Expect(sbrCSV.Object.Annotations).ToNot(BeNil(), "CSV annotations should not be nil")
 
+				// isSBR=true: pre-GA SBR shipped fips-compliant="false" (unlike the
+				// other operators); tls-profiles and fips are resolved by version.
+				expectedAnnotations := medik8sparams.ExpectedFeatureAnnotations(
+					sbrCSV.Object.Spec.Version.String(), true)
+
 				var annotationErrors []string
 
-				for annotationKey, expectedValue := range sbrparams.RequiredAnnotations {
+				for annotationKey, expectedValue := range expectedAnnotations {
 					annotationValue, exists := sbrCSV.Object.Annotations[annotationKey]
 					if !exists {
 						annotationErrors = append(annotationErrors,
